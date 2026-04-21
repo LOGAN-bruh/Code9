@@ -1,15 +1,15 @@
-# Code9
+# Code9 🐌
 Code9 is a localized, AI-powered development environment designed to turn fragmented code snippets into fully functional, executable programs instantly. Using the MLX framework, it generates the necessary "scaffolding"—imports, mock data, and environment setup—around a user's original code without altering the source logic.
 
-## Primary goal
+## Primary goal 🥅
 The primary goal of Code9 is to eliminate "environment friction." Developers often find useful logic or algorithms online but lack the time to set up the dependencies or mock data required to see them in action. Code9 automates this setup process locally on Apple Silicon, ensuring privacy and speed.
 
-## Target User
+## Target User 🎯
  - Students & Beginners: Who need to see how small logic blocks interact with a full environment.
  - Data Scientists/Researchers: Who want to quickly prototype a single function without building a full script.
  - Software Engineers: Looking for a "scratchpad" that intelligently handles boilerplate.
 
-## Planned Features
+## Planned Features 🕓
  - Dual-Pane Visual Editor: A web-based UI where the user types in one pane and the "AI Scaffolding" appears in another.
 
  - MLX Local Inference: Integration with mlx-lm to run Coder-series models (like Qwen2.5-Coder) entirely offline.
@@ -20,7 +20,7 @@ The primary goal of Code9 is to eliminate "environment friction." Developers oft
 
  - One-Click Execution: A seamless "Run" button that merges the AI shell with the user code and displays output in a dedicated console.
 
-## Breakdown of components
+## Breakdown of components ⚙️
  - Locally run Apple MLX on Mac with use of small 1B-7B models able to run on relitivly low powered machines
  - Friendly UI with easy to use systems
  - File writing/rewriting
@@ -62,10 +62,10 @@ Navigate to the folder containing your script and run -
 python Code9.py
 ```
     
-The app will detect CUDA and automatically route the AI model operations through your NVIDIA GPU.
+The app will detect CUDA and automatically route the AI model operations through your NVIDIA GPU 👍
 
 
-## Dificulties
+## Dificulties 😭
 
 The most significant technical hurdle will be Contextual Accuracy & Safety. 
 1.  Logic Mapping: It is difficult to ensure the AI creates a shell that actually fits the user’s intent. For example, if a user writes print(data.mean()), the AI must correctly guess if data should be a NumPy array, a Pandas DataFrame, or a simple list. If it guesses wrong, the code will crash despite having a "shell."
