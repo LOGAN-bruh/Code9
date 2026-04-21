@@ -73,16 +73,12 @@ Install the UI dependencies with this -
    pip install customtkinter Pillow
    ```
 Navigate to the folder containing your script and run -
-Install the UI dependencies with this - 
-  <div align="right">
-      <clipboard-copy value="python Code9.py" class="btn btn-sm">
-        Copy, Paste, and Enter into terminal
-      </clipboard-copy>
-    </div>
-   
-    ```sh
-    python Code9.py
-    ```    
+Install the UI dependencies with this:
+
+```sh
+python Code9.py
+```
+    
 The app will detect CUDA and automatically route the AI model operations through your NVIDIA GPU.
 
 
