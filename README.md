@@ -25,6 +25,16 @@ The primary goal of Code9 is to eliminate "environment friction." Developers oft
  - Friendly UI with easy to use systems
  - File writing/rewriting
 
+## How to Run
+WARNING⚠️: Application Optimised for Mac and Windows Systems with CUDA support.
+
+Running on Mac:
+Navigate to Mac Terminal. Install dependencies with this 
+'''markdown
+Copy, Paste, and Enter this into your Terminal
+'''sh
+pip3 install customtkinter Pillow mlx-lm torch
+
 ## Dificulties
 
 The most significant technical hurdle will be Contextual Accuracy & Safety. 
