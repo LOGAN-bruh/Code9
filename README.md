@@ -28,8 +28,8 @@ The primary goal of Code9 is to eliminate "environment friction." Developers oft
 ## How to Run
 WARNING⚠️: Application Optimised for Mac and Windows Systems with CUDA support.
 
-Running on Mac :
-Navigate to Mac Terminal. Install dependencies with this 
+### Running on Mac :
+Navigate to Mac Terminal. Install dependencies with this -  
  <div align="right">
    <clipboard-copy value="pip3 install customtkinter Pillow mlx-lm torch" class="btn btn-sm">
      Copy, Paste, and Enter into terminal
@@ -38,6 +38,52 @@ Navigate to Mac Terminal. Install dependencies with this
 
  ```sh
  pip3 install customtkinter Pillow mlx-lm torch
+ ```
+Navigate to the folder where your files are located and run - 
+ <div align="right">
+    <clipboard-copy value="python3 Code9.py" class="btn btn-sm">
+      Copy, Paste, and Enter into terminal
+    </clipboard-copy>
+  </div>
+ 
+  ```sh
+  python3 Code9.py
+  ```
+The first time you run a query, the application will automatically download the necessary models from Hugging Face. Subsequent runs will be much faster.
+
+### Running on Windows System with CUDA support🥶:
+Navigate to and open Command Prompt or PowerShell. Install dependencies with this -
+ <div align="right">
+    <clipboard-copy value="pip install torch --index-url https://download.pytorch.org/whl/cu121" class="btn btn-sm">
+      Copy, Paste, and Enter into terminal
+    </clipboard-copy>
+  </div>
+ 
+  ```sh
+  pip install torch --index-url https://download.pytorch.org/whl/cu121
+  ```
+Install the UI dependencies with this - 
+ <div align="right">
+     <clipboard-copy value="pip install customtkinter Pillow" class="btn btn-sm">
+       Copy, Paste, and Enter into terminal
+     </clipboard-copy>
+   </div>
+  
+   ```sh
+   pip install customtkinter Pillow
+   ```
+Navigate to the folder containing your script and run -
+Install the UI dependencies with this - 
+  <div align="right">
+      <clipboard-copy value="python Code9.py" class="btn btn-sm">
+        Copy, Paste, and Enter into terminal
+      </clipboard-copy>
+    </div>
+   
+    ```sh
+    python Code9.py
+    ```
+    The app will detect CUDA and automatically route the AI model operations through your NVIDIA GPU.
 
 
 ## Dificulties
