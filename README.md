@@ -82,9 +82,8 @@ Install the UI dependencies with this -
    
     ```sh
     python Code9.py
-    ```
-    
-    The app will detect CUDA and automatically route the AI model operations through your NVIDIA GPU.
+    ```    
+The app will detect CUDA and automatically route the AI model operations through your NVIDIA GPU.
 
 
 ## Dificulties
