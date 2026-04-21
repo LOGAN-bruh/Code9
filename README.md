@@ -30,14 +30,14 @@ WARNING⚠️: Application Optimised for Mac and Windows Systems with CUDA suppo
 
 Running on Mac :
 Navigate to Mac Terminal. Install dependencies with this 
-<div align="right">
-  <clipboard-copy value="pip3 install customtkinter Pillow mlx-lm torch" class="btn btn-sm">
-    Copy Command
-  </clipboard-copy>
-</div>
+ <div align="right">
+   <clipboard-copy value="pip3 install customtkinter Pillow mlx-lm torch" class="btn btn-sm">
+     Copy, Paste, and Enter into terminal
+   </clipboard-copy>
+ </div>
 
-```sh
-pip3 install customtkinter Pillow mlx-lm torch
+ ```sh
+ pip3 install customtkinter Pillow mlx-lm torch
 
 
 ## Dificulties
