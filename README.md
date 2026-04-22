@@ -26,7 +26,7 @@ The primary goal of Code9 is to eliminate "environment friction." Developers oft
  - File writing/rewriting
 
 ## How to Run
-WARNING⚠️: Application Optimised for Mac and Windows Systems with CUDA support.
+WARNING⚠️: Application Optimised for Mac or Windows Systems with CUDA support.
 
 ### Running on Mac :
 Navigate to Mac Terminal. Install dependencies with this -  
