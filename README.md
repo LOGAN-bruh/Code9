@@ -29,10 +29,22 @@ The primary goal of Code9 is to eliminate "environment friction." Developers oft
 WARNING⚠️: Application Optimised for Mac or Windows Systems with CUDA support.
 
 ### Running on Mac :
-Navigate to Mac Terminal. Install dependencies with this -  
+#### Navigate to Mac Terminal. Install dependencies with these (Please install them one at a time or skip if already downloaded) -  
 
  ```sh
- pip3 install customtkinter Pillow mlx-lm torch
+ /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+ ```
+
+ ```sh
+ brew install python python-tk
+ ```
+
+ ```sh
+ pip3 install customtkinter mlx mlx-lm
+ ```
+
+ ```sh
+ pip3 install torch
  ```
 
 Navigate to the folder where your files are located and run - 
