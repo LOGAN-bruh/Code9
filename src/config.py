@@ -19,9 +19,13 @@ class Config:
             "general_max_tokens": 320,
             "coding_max_tokens": 900,
             "run_timeout_sec": 60,
+            "stop_on_bad_response": True,
+            "require_code_block_for_injection": True,
             "persist_session": True,
             "restore_last_file": False,
             "last_opened_file": "",
+            "preferred_coding_model": "",
+            "preferred_shinzen_model": "",
         }
         self.load()
 
