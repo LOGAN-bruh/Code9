@@ -8,15 +8,37 @@ import threading
 import sys
 import traceback
 import re
+from datetime import datetime
 import time
 import difflib
 import json
 import random
+import inspect
+import ast
 from Shinzen import Shinzen
+from chat_sanitizer import ChatSanitizer
+from attachment_manager import AttachmentManager
+from model_wrapper import ModelWrapper
+
+currentTime = datetime.now()
+
+timedGreeting = ""
+
+# Reduce tokenizer worker/process side effects and noisy startup behavior.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 # Optional MLX integration
 try:
     from mlx_lm import load, generate
+    try:
+        from mlx_lm import stream_generate
+    except Exception:
+        stream_generate = None
+    try:
+        from mlx_lm.sample_utils import make_sampler, make_logits_processors
+    except Exception:
+        make_sampler = None
+        make_logits_processors = None
     MLX_AVAILABLE = True
 except Exception:
     MLX_AVAILABLE = False
@@ -27,9 +49,26 @@ except Exception:
     def generate(model, tokenizer, prompt, max_tokens=200):
         return ""
 
+    stream_generate = None
+    make_sampler = None
+    make_logits_processors = None
+
+if MLX_AVAILABLE:
+    try:
+        import mlx.core as mx
+        MLX_CORE_AVAILABLE = True
+    except Exception:
+        mx = None
+        MLX_CORE_AVAILABLE = False
+else:
+    mx = None
+    MLX_CORE_AVAILABLE = False
+
 
 # Detect device for model loading (MPS if available)
 def detect_device():
+    if MLX_AVAILABLE:
+        return "mlx-metal"
     try:
         import torch
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -43,34 +82,69 @@ def detect_device():
 
 DEVICE = detect_device()
 
-# Warm minimalist palette
-BG = "#F7F0E8"
-SURFACE = "#FFF8F1"
-SURFACE_ALT = "#FFF2E6"
-SOFT = "#EFCFB6"
-ACCENT = "#D48657"
-ACCENT_HOVER = "#BC7348"
-TEXT = "#3A2C26"
-MUTED = "#856B5E"
-BORDER = "#EADACB"
-OUTPUT_BG = "#FAF5EF"
+# Warm minimalist + soft glass palette
+BG = "#F5EFE7"
+SURFACE = "#FFFDFB"
+SURFACE_ALT = "#F6F2ED"
+SOFT = "#E6D8C7"
+ACCENT = "#C07A5B"
+ACCENT_HOVER = "#A8674A"
+TEXT = "#352922"
+MUTED = "#826D5D"
+BORDER = "#E4D8CB"
+OUTPUT_BG = "#FDF9F4"
+GLASS = "#FFF8F0"
 
 ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
 
 
 def choose_font(fallback_size=13):
-    candidates = ["Inter", "Avenir Next", "SF Pro Text", "Helvetica Neue", "Helvetica", "Arial"]
-    for name in candidates:
-        try:
-            return (name, fallback_size)
-        except Exception:
-            pass
-    return ("Helvetica", fallback_size)
+    import tkinter.font as tkfont
+    candidates = [
+        "Tiempos Text",
+        "SF Pro Text",
+        "San Francisco",
+        "New York",
+        "Avenir Next",
+        "Helvetica Neue",
+        "Helvetica",
+        "Times New Roman",
+    ]
+    try:
+        available = set(tkfont.families())
+        for name in candidates:
+            if name in available:
+                return (name, fallback_size)
+    except Exception:
+        pass
+    return ("Times New Roman", fallback_size)
 
 
 BASE_FONT = choose_font(13)
 MONO_FONT = (choose_font(13)[0], 13)
+
+WELCOME_VARIANTS = [
+    "Welcome back, {Username}.",
+    "Shinzen is happy to see you, {Username}!",
+    "Ready to code, {Username}?",
+    "Let's build something great today, {Username}.",
+    "{Username}, your coding companion is here.",
+    "Good to see you, {Username}. Let's get coding!",
+    "How are you {Username}?",
+    "{timedGreeting}, {Username}.",
+]
+
+CODING_MODEL_CANDIDATES = [
+    "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit",
+    "mlx-community/DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx",
+    "mlx-community/starcoder2-7b-4bit",
+]
+
+SHINZEN_MODEL_CANDIDATES = [
+    "mlx-community/Phi-3.5-mini-instruct-4bit",
+    "mlx-community/Qwen2.5-1.5B-Instruct-4bit",
+]
 
 
 class RotatingLoader:
@@ -101,25 +175,43 @@ class RotatingLoader:
         self.canvas.pack_forget()
 
 
-class Code9Claude(ctk.CTk):
+class Code9(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("Code9 - Dual AI Studio")
+        self.title("Code9 - AI-Powered Python Engine")
         self.geometry("1360x860")
         self.minsize(1120, 740)
         self.configure(fg_color=BG)
 
-        # Model/runtime state
+        # Model/runtime state — dual model: coding model + fast Phi for Shinzen
         self.model = None
         self.tokenizer = None
         self.model_ready = False
         self.model_failed = False
+        # Phi (fast) model for Shinzen bubble comments
+        self.phi_model = None
+        self.phi_tokenizer = None
+        self.phi_ready = False
         self.current_proc = None
         self.current_out_text = None
         self.current_file_path = None
         self.editor_dirty = False
         self._autosave_job = None
         self._settings_window = None
+        self._help_window = None
+        self._presence_reset_job = None
+        self._welcome_pool = []
+        self._chat_welcome_state = {}
+        self._chat_widget_kind = {}
+        self._typing_reset_job = None
+        self._bubble_hide_job = None
+        self._bubble_anim_job = None
+        self._bubble_visible = False
+        self._runtime_popup_only = True
+        self._runtime_win = None
+        self._runtime_text = None
+        self._runtime_entry = None
+        self._mlx_load_lock = threading.Lock()
 
         # Persistent paths
         self.config_dir = os.path.join(os.path.expanduser("~"), ".code9")
@@ -128,21 +220,57 @@ class Code9Claude(ctk.CTk):
         os.makedirs(self.config_dir, exist_ok=True)
 
         # Defaults (overridden by settings)
+        self.username = os.getenv("USER") or os.getenv("USERNAME") or "Coder"
         self.auto_run_coding = True
         self.insert_mode = "replace"          # replace | append
         self.run_mode = "temp"                # temp | active_file
         self.enable_typewriter = True
-        self.general_max_tokens = 320
         self.coding_max_tokens = 900
         self.run_timeout_sec = 60
         self.persist_session = True
         self.restore_last_file = False
         self.last_opened_file = ""
+        # Link Shinzen suggestions automatically into the Coding AI prompts
+        self.include_shinzen_in_coding = True
+        self.stop_on_bad_response = True
+        self.require_code_block_for_injection = True
+        self.preferred_coding_model = ""
+        self.preferred_shinzen_model = ""
+        self.loaded_coding_model_name = ""
+        self.loaded_shinzen_model_name = ""
+        self._last_ai_injection = None
+        self.shinzen_feedback_cooldown_sec = 20
+        self.shinzen_refresh_timer_sec = 30
+        self.shinzen_idle_suggestions_enabled = True
+        self.shinzen_idle_interval_sec = 60
+        self.shinzen_idle_threshold_sec = 18
+        self._shinzen_analysis_inflight = False
+        self._shinzen_job = None
+        self._shinzen_periodic_job = None
+        self._shinzen_force_refresh = False
+        self._shinzen_idle_hint = False
+        self._last_shinzen_digest = ""
+        self._last_shinzen_comment = ""
+        self._last_shinzen_comment_ts = 0.0
+        self._last_shinzen_issue_count = 0
+        self._last_typing_ts = time.time()
+        self._last_idle_suggestion_ts = 0.0
 
-        # Safety and verification controls
-        self.enable_verifier = True
-        self.safe_defaults = {"temperature": 0.0, "top_p": 0.8, "repetition_penalty": 1.4}
-
+        # Safety and performance controls
+        # Verifier adds an extra full model pass, so keep it off by default for speed.
+        self.enable_verifier = False
+        self.safe_defaults = {
+            "temperature": 0.0,
+            "top_p": 0.0,
+            "top_k": 0,
+            "repetition_penalty": 1.0,
+            "max_kv_size": 8192,
+            "prefill_step_size": 1024,
+            "kv_bits": 8,
+            "kv_group_size": 64,
+            "quantized_kv_start": 1024,
+        }
+        #Ideas for coding
         self.project_ideas = [
             "Add a visual run history timeline with diff snapshots and re-run buttons.",
             "Support multi-file projects with a compact file tree and tabbed editors.",
@@ -157,17 +285,19 @@ class Code9Claude(ctk.CTk):
         ]
 
         self._load_preferences()
+        self.model_wrapper = ModelWrapper(load_fn=load, generate_fn=generate)
 
         # Tokens used to cancel in-progress AI responses (increment to cancel)
-        self.abort_tokens = {"general": 0, "coding": 0}
+        self.abort_tokens = {"coding": 0}
         # Active tasks counter used to determine Idle status
         self._active_tasks = 0
+        self._ui_busy = False
         # Attachments for coding prompts: key -> payload
         self.coding_attachments = {}
 
-        # 2/3 left engine, 1/3 right dual chat
-        self.grid_columnconfigure(0, weight=2)
-        self.grid_columnconfigure(1, weight=1, minsize=360)
+        # Engine-heavy split: left ~75%, right ~25%
+        self.grid_columnconfigure(0, weight=3)
+        self.grid_columnconfigure(1, weight=1, minsize=260)
         self.grid_rowconfigure(1, weight=1)
 
         self._build_topbar()
@@ -182,25 +312,53 @@ class Code9Claude(ctk.CTk):
         self._highlight_syntax()
         self._update_run_mode_badge()
         self._refresh_coding_controls()
+        self._refresh_status()
+        self._start_shinzen_loop()
 
         if MLX_AVAILABLE:
-            threading.Thread(target=self._load_model, daemon=True).start()
+            self._set_presence_message(f"Loading models on {DEVICE}...", mood="thinking")
+            threading.Thread(target=self._load_models_serial, daemon=True).start()
         else:
-            self.status_label.configure(text="Model: not installed")
+            self._set_presence_message("MLX model runtime not found. You can still run local Python code.", mood="concern")
+    
+    def _on_editor_typing(self, event=None):
+        # 1. Put Shinzen into a short interactive typing expression.
+        try:
+            if hasattr(self, "shinzen") and self.shinzen is not None:
+                if hasattr(self.shinzen, "trigger"):
+                    self.shinzen.trigger("typing", hold_ms=900)
+                else:
+                    self.shinzen.set_state("peering")
+        except Exception:
+            pass
+        self._last_typing_ts = time.time()
+        self._schedule_shinzen_analysis(delay=950, force=False)
 
+        # 2. Reset the presence message to normal after 1.5 seconds of no typing
+        if self._typing_reset_job is not None:
+            self.after_cancel(self._typing_reset_job)
+        self._typing_reset_job = self.after(1500, self._stop_peering)
+
+    def _stop_peering(self):
+        self._typing_reset_job = None
+        try:
+            self._refresh_status()
+        except Exception:
+            if hasattr(self, "shinzen"):
+                self.shinzen.set_state("idle")
     # -------------------- UI BUILDERS --------------------
     def _build_topbar(self):
-        self.topbar = ctk.CTkFrame(self, fg_color=BG, corner_radius=0, height=74)
+        self.topbar = ctk.CTkFrame(self, fg_color=BG, corner_radius=0, height=88)
         self.topbar.grid(row=0, column=0, columnspan=2, sticky="ew")
         self.topbar.grid_propagate(False)
 
         title_wrap = tk.Frame(self.topbar, bg=BG)
-        title_wrap.pack(side="left", padx=24, pady=10)
+        title_wrap.pack(side="left", padx=24, pady=12)
 
         self.title_label = ctk.CTkLabel(
             title_wrap,
             text="Code9",
-            font=(BASE_FONT[0], 21, "bold"),
+            font=(BASE_FONT[0], 60, "bold"),
             text_color=TEXT,
             fg_color=BG,
         )
@@ -215,68 +373,80 @@ class Code9Claude(ctk.CTk):
         )
         self.file_label.pack(anchor="w", pady=(2, 0))
 
-        status_wrap = tk.Frame(self.topbar, bg=BG)
-        status_wrap.pack(side="right", padx=(8, 20), pady=10)
+        # Status text is now fully integrated into the Shinzen speech bubble on the right.
+        self.status_label = None
 
-        self.status_label = ctk.CTkLabel(
-            status_wrap,
-            text="Model: loading..." if MLX_AVAILABLE else "Model: not installed",
-            font=(BASE_FONT[0], 11),
-            text_color=MUTED,
-            fg_color=BG,
-        )
-        self.status_label.pack(side="right")
-
-        self.loader_frame = tk.Frame(status_wrap, bg=BG)
-        self.loader = Shinzen(
-            self.loader_frame,
-            sprite_paths=[
-                os.path.join(os.path.dirname(__file__), "SnailSprite", "SnailLoading1.png"),
-                os.path.join(os.path.dirname(__file__), "SnailSprite", "SnailLoading2.png"),
-                os.path.join(os.path.dirname(__file__), "SnailSprite", "SnailLoading3.png"),
-            ],
-            frame_duration=160,
-            size=(20, 20),
-        )
-
+        # Top-right loader removed — Shinzen will be shown in the right column (larger instance)
         self.btn_bar = tk.Frame(self.topbar, bg=BG)
-        self.btn_bar.pack(side="right", padx=10, pady=10)
+        self.btn_bar.pack(side="right", padx=10, pady=12)
 
-        self.open_button = ctk.CTkButton(self.btn_bar, text="Open", width=70, fg_color=SURFACE_ALT, hover_color=SOFT, text_color=TEXT, command=self._on_open_clicked)
+        self.open_button = self._make_toolbar_button(self.btn_bar, "Open", 70, self._on_open_clicked)
         self.open_button.pack(side="left", padx=4)
 
-        self.save_button = ctk.CTkButton(self.btn_bar, text="Save", width=70, fg_color=SOFT, hover_color=SURFACE_ALT, text_color=TEXT, command=self._on_save_clicked)
+        self.save_button = self._make_toolbar_button(self.btn_bar, "Save", 70, self._on_save_clicked)
         self.save_button.pack(side="left", padx=4)
 
-        self.save_as_button = ctk.CTkButton(self.btn_bar, text="Save As", width=82, fg_color=SURFACE_ALT, hover_color=SOFT, text_color=TEXT, command=self._on_save_as_clicked)
+        self.save_as_button = self._make_toolbar_button(self.btn_bar, "Save As", 84, self._on_save_as_clicked)
         self.save_as_button.pack(side="left", padx=4)
 
-        self.run_button = ctk.CTkButton(self.btn_bar, text="Run", width=72, fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color="white", command=self._on_run_clicked)
+        self.run_button = self._make_toolbar_button(self.btn_bar, "Run", 72, self._on_run_clicked, primary=True)
         self.run_button.pack(side="left", padx=4)
 
-        self.stop_button = ctk.CTkButton(self.btn_bar, text="Stop", width=72, fg_color="#E8A395", hover_color="#DA8D7D", text_color=TEXT, command=self._on_stop_clicked)
+        self.stop_button = self._make_toolbar_button(
+            self.btn_bar,
+            "Stop",
+            72,
+            self._on_stop_clicked,
+            fg="#EAC8BD",
+            hover="#DEB0A2",
+        )
         self.stop_button.pack(side="left", padx=4)
 
-        self.ai_fill_btn = ctk.CTkButton(self.btn_bar, text="AI Fill", width=82, fg_color=SURFACE_ALT, hover_color=SOFT, text_color=TEXT, command=self._on_ai_fill_clicked)
+        self.ai_fill_btn = self._make_toolbar_button(self.btn_bar, "AI Fill", 84, self._on_ai_fill_clicked)
         self.ai_fill_btn.pack(side="left", padx=4)
 
-        self.shell_btn = ctk.CTkButton(self.btn_bar, text="Shell", width=72, fg_color=SURFACE_ALT, hover_color=SOFT, text_color=TEXT, command=self._on_create_shell_clicked)
+        self.undo_ai_btn = self._make_toolbar_button(self.btn_bar, "Undo AI", 84, self._undo_last_ai_injection)
+        self.undo_ai_btn.pack(side="left", padx=4)
+
+        self.runtime_btn = self._make_toolbar_button(self.btn_bar, "Runtime", 84, self._open_runtime_terminal)
+        self.runtime_btn.pack(side="left", padx=4)
+
+        self.shell_btn = self._make_toolbar_button(self.btn_bar, "Shell", 72, self._on_create_shell_clicked)
         self.shell_btn.pack(side="left", padx=4)
 
-        self.ideas_btn = ctk.CTkButton(self.btn_bar, text="Ideas", width=72, fg_color=SURFACE_ALT, hover_color=SOFT, text_color=TEXT, command=self._share_project_ideas)
+        self.ideas_btn = self._make_toolbar_button(self.btn_bar, "Ideas", 72, self._share_project_ideas)
         self.ideas_btn.pack(side="left", padx=4)
 
-        self.settings_btn = ctk.CTkButton(self.btn_bar, text="Settings", width=84, fg_color=SURFACE_ALT, hover_color=SOFT, text_color=TEXT, command=self._open_settings)
+        self.settings_btn = self._make_toolbar_button(self.btn_bar, "Settings", 86, self._open_settings)
         self.settings_btn.pack(side="left", padx=4)
 
-        self.clear_chat_btn = ctk.CTkButton(self.btn_bar, text="Clear", width=68, fg_color=SURFACE_ALT, hover_color=SOFT, text_color=TEXT, command=self._on_clear_clicked)
+        self.help_btn = self._make_toolbar_button(self.btn_bar, "Help", 72, self._open_help)
+        self.help_btn.pack(side="left", padx=4)
+
+        self.clear_chat_btn = self._make_toolbar_button(self.btn_bar, "Clear", 70, self._on_clear_clicked)
         self.clear_chat_btn.pack(side="left", padx=4)
 
+    def _make_toolbar_button(self, parent, text, width, command, primary=False, fg=None, hover=None):
+        base_fg = ACCENT if primary else SURFACE_ALT
+        base_hover = ACCENT_HOVER if primary else SOFT
+        text_color = "white" if primary else TEXT
+        return ctk.CTkButton(
+            parent,
+            text=text,
+            width=width,
+            height=34,
+            corner_radius=16,
+            fg_color=fg or base_fg,
+            hover_color=hover or base_hover,
+            text_color=text_color,
+            font=(BASE_FONT[0], 12, "bold"),
+            command=command,
+        )
+
     def _build_engine_panel(self):
-        self.left = ctk.CTkFrame(self, fg_color=SURFACE, corner_radius=18, border_width=1, border_color=BORDER)
+        self.left = ctk.CTkFrame(self, fg_color=SURFACE, corner_radius=18)
         self.left.grid(row=1, column=0, padx=(20, 10), pady=18, sticky="nsew")
-        self.left.grid_rowconfigure(1, weight=4)
-        self.left.grid_rowconfigure(2, weight=2)
+        self.left.grid_rowconfigure(1, weight=1)
         self.left.grid_columnconfigure(0, weight=1)
 
         left_header = tk.Frame(self.left, bg=SURFACE)
@@ -323,6 +493,7 @@ class Code9Claude(ctk.CTk):
             maxundo=-1,
         )
         self.editor.grid(row=0, column=0, sticky="nsew")
+        self.editor.bind("<KeyPress>", self._on_editor_typing)  
 
         self.editor_vsb = tk.Scrollbar(editor_holder, orient="vertical", command=self.editor.yview)
         self.editor_vsb.grid(row=0, column=1, sticky="ns")
@@ -332,87 +503,102 @@ class Code9Claude(ctk.CTk):
 
         self.editor.config(yscrollcommand=self.editor_vsb.set, xscrollcommand=self.editor_hsb.set)
 
-        output_holder = tk.Frame(self.left, bg=SURFACE)
-        output_holder.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 12))
-        output_holder.grid_rowconfigure(1, weight=1)
-        output_holder.grid_columnconfigure(0, weight=1)
+        # Runtime I/O is intentionally not shown inline; it opens in a separate runtime window.
+        self.output_text = None
+        self.terminal_input = None
+        self.inline_output_text = None
+        self.inline_terminal_input = None
 
-        out_header = tk.Frame(output_holder, bg=SURFACE)
-        out_header.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        out_header.grid_columnconfigure(0, weight=1)
+    def _build_right_panel(self):
+        self.right = ctk.CTkFrame(self, fg_color=BG, corner_radius=18, width=290)
+        self.right.grid(row=1, column=1, padx=(8, 18), pady=18, sticky="nsew")
+        self.right.grid_propagate(False)
 
-        out_title = ctk.CTkLabel(
-            out_header,
-            text="Runtime Output",
-            font=(BASE_FONT[0], 13, "bold"),
-            text_color=TEXT,
-            fg_color=SURFACE,
+        # Row 0: Shinzen; Row 1: coding AI card
+        self.right.grid_rowconfigure(0, weight=0)
+        self.right.grid_rowconfigure(1, weight=1, minsize=220)
+        self.right.grid_columnconfigure(0, weight=1)
+
+        # --- Shinzen row ---
+        snail_row = tk.Frame(self.right, bg=BG)
+        snail_row.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 6))
+        snail_row.grid_columnconfigure(0, weight=1)
+
+        # --- Snail (right of bubble) ---
+        self.shinzen = Shinzen(
+            snail_row,
+            sprite_paths=None,
+            frame_duration=130,
+            size=(148, 148),
+            on_click=self._on_snail_clicked,
         )
-        out_title.grid(row=0, column=0, sticky="w")
+        self.shinzen.canvas.configure(bg=BG)
+        self.shinzen.canvas.grid(row=0, column=0, padx=(4, 0), pady=4, sticky="e")
 
-        self.clear_output_btn = ctk.CTkButton(
-            out_header,
-            text="Clear Output",
-            width=100,
-            fg_color=SURFACE_ALT,
-            hover_color=SOFT,
-            text_color=TEXT,
-            command=self._clear_output_panel,
-        )
-        self.clear_output_btn.grid(row=0, column=1, sticky="e")
+        try:
+            self.shinzen.start()
+        except Exception:
+            pass
 
-        self.output_text = tk.Text(
-            output_holder,
-            font=(MONO_FONT[0], 12),
-            bg=OUTPUT_BG,
+        # Speech bubble overlays the right panel so it never affects Engine width.
+        self.shinzen_bubble_outer = tk.Frame(self.right, bg=BG)
+        bubble_row = tk.Frame(self.shinzen_bubble_outer, bg=BG)
+        bubble_row.pack(fill="both", expand=True)
+
+        bubble_frame = ctk.CTkFrame(
+            bubble_row,
+            fg_color=GLASS,
+            corner_radius=16,
+            border_width=1,
+            border_color=BORDER,
+            width=180,
+            height=210,
+            )
+        bubble_frame.pack(side="left", padx=(0, 0), pady=(0, 0))
+        bubble_frame.pack_propagate(False)
+
+        self.shinzen_bubble_text = tk.Text(
+            bubble_frame,
+            height=4,
+            bg=GLASS,
             fg=TEXT,
-            insertbackground=TEXT,
             bd=0,
             relief="flat",
             highlightthickness=0,
             wrap="word",
-            padx=12,
-            pady=10,
+            padx=2, # slightly reduced internal padding 
+            pady=2,
             state="disabled",
-        )
-        self.output_text.grid(row=1, column=0, sticky="nsew")
+            font=(BASE_FONT[0], 11),
+            )
+        
+        self.shinzen_bubble_text.pack(fill="both", expand=True, padx=8, pady=8) 
 
-    def _build_right_panel(self):
-        self.right = ctk.CTkFrame(self, fg_color=BG, corner_radius=18)
-        self.right.grid(row=1, column=1, padx=(8, 18), pady=18, sticky="nsew")
-        self.right.grid_rowconfigure(0, weight=1)
-        self.right.grid_rowconfigure(1, weight=1)
-        self.right.grid_columnconfigure(0, weight=1)
+        tail = tk.Canvas(bubble_row, width=16, height=24, bg=BG, highlightthickness=0)
+        tail.pack(side="left", padx=(0, 0), pady=22)
+        tail.create_polygon(1, 12, 14, 5, 14, 19, fill=GLASS, outline=BORDER)
 
-        self.general_card = self._build_chat_card(
-            parent=self.right,
-            row=0,
-            title="General AI",
-            placeholder="Ask anything...",
-            ask_cmd=self._on_general_ask_clicked,
-            kind="general",
-        )
-
+        # --- Coding AI card (below snail+bubble row) ---
         self.coding_card = self._build_chat_card(
             parent=self.right,
             row=1,
-            title="Coding AI",
+            title="AI",
             placeholder="Ask for code, fixes, or refactors...",
             ask_cmd=self._on_coding_ask_clicked,
             kind="coding",
         )
 
-    def _build_chat_card(self, parent, row, title, placeholder, ask_cmd, kind="general"):
-        card = ctk.CTkFrame(parent, fg_color=SURFACE, corner_radius=18, border_width=1, border_color=BORDER)
+    def _build_chat_card(self, parent, row, title, placeholder, ask_cmd, kind="coding"):
+        card = ctk.CTkFrame(parent, fg_color=GLASS, corner_radius=20)
         card.grid(row=row, column=0, sticky="nsew", pady=(0, 10) if row == 0 else (8, 0))
         card.grid_rowconfigure(1, weight=1)
         card.grid_columnconfigure(0, weight=1)
 
-        header = tk.Frame(card, bg=SURFACE)
+        header = tk.Frame(card, bg=GLASS)
         header.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 8))
         header.grid_columnconfigure(0, weight=1)
 
-        lbl = ctk.CTkLabel(header, text=title, font=(BASE_FONT[0], 15, "bold"), text_color=TEXT, fg_color=SURFACE)
+        lbl = ctk.CTkLabel(header, text=title, font=(BASE_FONT[0], 15, "bold"), text_color=TEXT, fg_color=GLASS)
         lbl.grid(row=0, column=0, sticky="w")
 
         if kind == "coding":
@@ -420,6 +606,7 @@ class Code9Claude(ctk.CTk):
                 header,
                 text="Auto Run: On" if self.auto_run_coding else "Auto Run: Off",
                 width=104,
+                corner_radius=14,
                 fg_color=SURFACE_ALT,
                 hover_color=SOFT,
                 text_color=TEXT,
@@ -431,6 +618,7 @@ class Code9Claude(ctk.CTk):
                 header,
                 text="Insert: Replace" if self.insert_mode == "replace" else "Insert: Append",
                 width=112,
+                corner_radius=14,
                 fg_color=SURFACE_ALT,
                 hover_color=SOFT,
                 text_color=TEXT,
@@ -443,6 +631,7 @@ class Code9Claude(ctk.CTk):
             header,
             text="Stop",
             width=80,
+            corner_radius=14,
             fg_color=SURFACE_ALT,
             hover_color=SOFT,
             text_color=TEXT,
@@ -450,19 +639,17 @@ class Code9Claude(ctk.CTk):
         )
         stop_btn.grid(row=0, column=3, padx=(6, 0), sticky="e")
         # keep a reference so tests or other code can access it
-        if kind == "general":
-            self.general_stop_btn = stop_btn
-        else:
+        if kind == "coding":
             self.coding_stop_btn = stop_btn
 
-        text_wrap = tk.Frame(card, bg=SURFACE)
+        text_wrap = tk.Frame(card, bg=GLASS)
         text_wrap.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 8))
         text_wrap.grid_rowconfigure(0, weight=1)
         text_wrap.grid_columnconfigure(0, weight=1)
 
         chat_text = tk.Text(
             text_wrap,
-            bg="#FFF9F4",
+            bg="#FFFCF8",
             fg=TEXT,
             bd=0,
             relief="flat",
@@ -479,13 +666,15 @@ class Code9Claude(ctk.CTk):
         chat_vsb.grid(row=0, column=1, sticky="ns")
         chat_text.config(yscrollcommand=chat_vsb.set)
         self._setup_chat_tags(chat_text)
+        self._chat_widget_kind[chat_text] = kind
+        self._set_chat_welcome(chat_text, kind=kind)
 
         # Attachments row (visible only for coding card)
-        attachments_frame = tk.Frame(card, bg=SURFACE)
+        attachments_frame = tk.Frame(card, bg=GLASS)
         attachments_frame.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 6))
         attachments_frame.grid_columnconfigure(0, weight=1)
 
-        input_row = tk.Frame(card, bg=SURFACE)
+        input_row = tk.Frame(card, bg=GLASS)
         input_row.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 12))
         input_row.grid_columnconfigure(0, weight=1)
 
@@ -495,7 +684,7 @@ class Code9Claude(ctk.CTk):
             placeholder_text=placeholder,
             textvariable=input_var,
             fg_color=SURFACE_ALT,
-            border_width=0,
+            corner_radius=15,
             text_color=TEXT,
         )
         input_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
@@ -504,6 +693,7 @@ class Code9Claude(ctk.CTk):
             input_row,
             text="Ask",
             width=70,
+            corner_radius=14,
             fg_color=ACCENT,
             hover_color=ACCENT_HOVER,
             text_color="white",
@@ -515,6 +705,7 @@ class Code9Claude(ctk.CTk):
             input_row,
             text="Copy",
             width=70,
+            corner_radius=14,
             fg_color=SURFACE_ALT,
             hover_color=SOFT,
             text_color=TEXT,
@@ -540,31 +731,49 @@ class Code9Claude(ctk.CTk):
             with open(self.settings_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
+            self.username = data.get("username", self.username)
             self.auto_run_coding = bool(data.get("auto_run_coding", self.auto_run_coding))
             self.insert_mode = data.get("insert_mode", self.insert_mode) if data.get("insert_mode") in {"replace", "append"} else self.insert_mode
             self.run_mode = data.get("run_mode", self.run_mode) if data.get("run_mode") in {"temp", "active_file"} else self.run_mode
             self.enable_typewriter = bool(data.get("enable_typewriter", self.enable_typewriter))
-            self.general_max_tokens = self._coerce_int(data.get("general_max_tokens", self.general_max_tokens), 80, 2400, self.general_max_tokens)
             self.coding_max_tokens = self._coerce_int(data.get("coding_max_tokens", self.coding_max_tokens), 120, 4000, self.coding_max_tokens)
             self.run_timeout_sec = self._coerce_int(data.get("run_timeout_sec", self.run_timeout_sec), 5, 600, self.run_timeout_sec)
             self.persist_session = bool(data.get("persist_session", self.persist_session))
             self.restore_last_file = bool(data.get("restore_last_file", self.restore_last_file))
             self.last_opened_file = data.get("last_opened_file", "")
+            self.include_shinzen_in_coding = bool(data.get("include_shinzen_in_coding", self.include_shinzen_in_coding))
+            self.stop_on_bad_response = bool(data.get("stop_on_bad_response", self.stop_on_bad_response))
+            self.require_code_block_for_injection = bool(data.get("require_code_block_for_injection", self.require_code_block_for_injection))
+            self.preferred_coding_model = data.get("preferred_coding_model", self.preferred_coding_model)
+            self.preferred_shinzen_model = data.get("preferred_shinzen_model", self.preferred_shinzen_model)
+            self.shinzen_feedback_cooldown_sec = self._coerce_int(data.get("shinzen_feedback_cooldown_sec", self.shinzen_feedback_cooldown_sec), 5, 300, self.shinzen_feedback_cooldown_sec)
+            self.shinzen_refresh_timer_sec = self._coerce_int(data.get("shinzen_refresh_timer_sec", self.shinzen_refresh_timer_sec), 10, 300, self.shinzen_refresh_timer_sec)
+            self.shinzen_idle_suggestions_enabled = bool(data.get("shinzen_idle_suggestions_enabled", self.shinzen_idle_suggestions_enabled))
+            self.shinzen_idle_interval_sec = self._coerce_int(data.get("shinzen_idle_interval_sec", self.shinzen_idle_interval_sec), 20, 600, self.shinzen_idle_interval_sec)
         except Exception:
             pass
 
     def _save_preferences(self):
         data = {
+            "username": self.username,
             "auto_run_coding": self.auto_run_coding,
             "insert_mode": self.insert_mode,
             "run_mode": self.run_mode,
             "enable_typewriter": self.enable_typewriter,
-            "general_max_tokens": self.general_max_tokens,
             "coding_max_tokens": self.coding_max_tokens,
             "run_timeout_sec": self.run_timeout_sec,
             "persist_session": self.persist_session,
             "restore_last_file": self.restore_last_file,
             "last_opened_file": self.current_file_path or self.last_opened_file,
+            "include_shinzen_in_coding": self.include_shinzen_in_coding,
+            "stop_on_bad_response": self.stop_on_bad_response,
+            "require_code_block_for_injection": self.require_code_block_for_injection,
+            "preferred_coding_model": self.preferred_coding_model,
+            "preferred_shinzen_model": self.preferred_shinzen_model,
+            "shinzen_feedback_cooldown_sec": self.shinzen_feedback_cooldown_sec,
+            "shinzen_refresh_timer_sec": self.shinzen_refresh_timer_sec,
+            "shinzen_idle_suggestions_enabled": self.shinzen_idle_suggestions_enabled,
+            "shinzen_idle_interval_sec": self.shinzen_idle_interval_sec,
         }
         try:
             with open(self.settings_path, "w", encoding="utf-8") as f:
@@ -633,12 +842,13 @@ class Code9Claude(ctk.CTk):
 
         win = ctk.CTkToplevel(self)
         win.title("Code9 Settings")
-        win.geometry("520x520")
+        win.geometry("560x660")
         win.configure(fg_color=SURFACE)
-        win.resizable(False, False)
+        win.resizable(True, True)
+        win.minsize(560, 620)
         self._settings_window = win
 
-        wrap = ctk.CTkFrame(win, fg_color=SURFACE, corner_radius=0)
+        wrap = ctk.CTkScrollableFrame(win, fg_color=SURFACE, corner_radius=16)
         wrap.pack(fill="both", expand=True, padx=16, pady=16)
 
         ctk.CTkLabel(wrap, text="Behavior", text_color=TEXT, font=(BASE_FONT[0], 16, "bold")).pack(anchor="w", pady=(0, 8))
@@ -647,11 +857,17 @@ class Code9Claude(ctk.CTk):
         type_var = tk.BooleanVar(value=self.enable_typewriter)
         persist_var = tk.BooleanVar(value=self.persist_session)
         restore_var = tk.BooleanVar(value=self.restore_last_file)
+        stop_bad_var = tk.BooleanVar(value=self.stop_on_bad_response)
+        require_block_var = tk.BooleanVar(value=self.require_code_block_for_injection)
+        idle_ideas_var = tk.BooleanVar(value=self.shinzen_idle_suggestions_enabled)
 
         ctk.CTkCheckBox(wrap, text="Auto-run code from Coding AI", variable=auto_run_var, text_color=TEXT).pack(anchor="w", pady=4)
         ctk.CTkCheckBox(wrap, text="Typewriter animation in chat", variable=type_var, text_color=TEXT).pack(anchor="w", pady=4)
         ctk.CTkCheckBox(wrap, text="Persist session draft", variable=persist_var, text_color=TEXT).pack(anchor="w", pady=4)
         ctk.CTkCheckBox(wrap, text="Restore last opened file on launch", variable=restore_var, text_color=TEXT).pack(anchor="w", pady=4)
+        ctk.CTkCheckBox(wrap, text="Auto-stop nonsense coding replies", variable=stop_bad_var, text_color=TEXT).pack(anchor="w", pady=4)
+        ctk.CTkCheckBox(wrap, text="Require fenced code block before injection", variable=require_block_var, text_color=TEXT).pack(anchor="w", pady=4)
+        ctk.CTkCheckBox(wrap, text="Enable idle code ideas", variable=idle_ideas_var, text_color=TEXT).pack(anchor="w", pady=4)
 
         ctk.CTkLabel(wrap, text="Run Mode", text_color=TEXT, font=(BASE_FONT[0], 13, "bold")).pack(anchor="w", pady=(14, 4))
         run_mode_map = {
@@ -669,52 +885,256 @@ class Code9Claude(ctk.CTk):
         insert_var = tk.StringVar(value="Replace Engine Content" if self.insert_mode == "replace" else "Append to Engine Content")
         ctk.CTkOptionMenu(wrap, values=list(insert_map.keys()), variable=insert_var, fg_color=SURFACE_ALT, button_color=SOFT, button_hover_color=ACCENT_HOVER, text_color=TEXT).pack(anchor="w", pady=2)
 
-        grid = ctk.CTkFrame(wrap, fg_color=SURFACE)
+        ctk.CTkLabel(wrap, text="Coding Model", text_color=TEXT, font=(BASE_FONT[0], 13, "bold")).pack(anchor="w", pady=(12, 4))
+        coding_model_values = ["(Auto)"] + CODING_MODEL_CANDIDATES
+        coding_model_var = tk.StringVar(value=self.preferred_coding_model if self.preferred_coding_model else "(Auto)")
+        ctk.CTkOptionMenu(
+            wrap,
+            values=coding_model_values,
+            variable=coding_model_var,
+            fg_color=SURFACE_ALT,
+            button_color=SOFT,
+            button_hover_color=ACCENT_HOVER,
+            text_color=TEXT,
+        ).pack(anchor="w", pady=2)
+
+        ctk.CTkLabel(wrap, text="Shinzen Comment Model", text_color=TEXT, font=(BASE_FONT[0], 13, "bold")).pack(anchor="w", pady=(12, 4))
+        shinzen_model_values = ["(Auto)"] + SHINZEN_MODEL_CANDIDATES
+        shinzen_model_var = tk.StringVar(value=self.preferred_shinzen_model if self.preferred_shinzen_model else "(Auto)")
+        ctk.CTkOptionMenu(
+            wrap,
+            values=shinzen_model_values,
+            variable=shinzen_model_var,
+            fg_color=SURFACE_ALT,
+            button_color=SOFT,
+            button_hover_color=ACCENT_HOVER,
+            text_color=TEXT,
+        ).pack(anchor="w", pady=2)
+
+        grid = ctk.CTkFrame(wrap, fg_color=SURFACE, corner_radius=12)
         grid.pack(fill="x", pady=(14, 2))
         grid.grid_columnconfigure(1, weight=1)
 
-        ctk.CTkLabel(grid, text="General max tokens", text_color=MUTED).grid(row=0, column=0, sticky="w", pady=6)
-        general_entry = ctk.CTkEntry(grid, fg_color=SURFACE_ALT, border_width=0)
-        general_entry.grid(row=0, column=1, sticky="ew", padx=(10, 0), pady=6)
-        general_entry.insert(0, str(self.general_max_tokens))
-
-        ctk.CTkLabel(grid, text="Coding max tokens", text_color=MUTED).grid(row=1, column=0, sticky="w", pady=6)
-        coding_entry = ctk.CTkEntry(grid, fg_color=SURFACE_ALT, border_width=0)
-        coding_entry.grid(row=1, column=1, sticky="ew", padx=(10, 0), pady=6)
+        ctk.CTkLabel(grid, text="Coding max tokens", text_color=MUTED).grid(row=0, column=0, sticky="w", pady=6)
+        coding_entry = ctk.CTkEntry(grid, fg_color=SURFACE_ALT)
+        coding_entry.grid(row=0, column=1, sticky="ew", padx=(10, 0), pady=6)
         coding_entry.insert(0, str(self.coding_max_tokens))
 
+        ctk.CTkLabel(grid, text="Username", text_color=MUTED).grid(row=1, column=0, sticky="w", pady=6)
+        username_entry = ctk.CTkEntry(grid, fg_color=SURFACE_ALT)
+        username_entry.grid(row=1, column=1, sticky="ew", padx=(10, 0), pady=6)
+        username_entry.insert(0, str(self.username))
+
         ctk.CTkLabel(grid, text="Run timeout (sec)", text_color=MUTED).grid(row=2, column=0, sticky="w", pady=6)
-        timeout_entry = ctk.CTkEntry(grid, fg_color=SURFACE_ALT, border_width=0)
+        timeout_entry = ctk.CTkEntry(grid, fg_color=SURFACE_ALT)
         timeout_entry.grid(row=2, column=1, sticky="ew", padx=(10, 0), pady=6)
         timeout_entry.insert(0, str(self.run_timeout_sec))
 
-        btns = ctk.CTkFrame(wrap, fg_color=SURFACE)
-        btns.pack(fill="x", pady=(16, 2))
+        ctk.CTkLabel(grid, text="Shinzen cooldown (sec)", text_color=MUTED).grid(row=3, column=0, sticky="w", pady=6)
+        shinzen_cooldown_entry = ctk.CTkEntry(grid, fg_color=SURFACE_ALT)
+        shinzen_cooldown_entry.grid(row=3, column=1, sticky="ew", padx=(10, 0), pady=6)
+        shinzen_cooldown_entry.insert(0, str(self.shinzen_feedback_cooldown_sec))
 
-        def apply_and_close():
+        ctk.CTkLabel(grid, text="Shinzen refresh timer (sec)", text_color=MUTED).grid(row=4, column=0, sticky="w", pady=6)
+        shinzen_refresh_entry = ctk.CTkEntry(grid, fg_color=SURFACE_ALT)
+        shinzen_refresh_entry.grid(row=4, column=1, sticky="ew", padx=(10, 0), pady=6)
+        shinzen_refresh_entry.insert(0, str(self.shinzen_refresh_timer_sec))
+
+        ctk.CTkLabel(grid, text="Idle suggestion interval (sec)", text_color=MUTED).grid(row=5, column=0, sticky="w", pady=6)
+        shinzen_idle_entry = ctk.CTkEntry(grid, fg_color=SURFACE_ALT)
+        shinzen_idle_entry.grid(row=5, column=1, sticky="ew", padx=(10, 0), pady=6)
+        shinzen_idle_entry.insert(0, str(self.shinzen_idle_interval_sec))
+
+        btns = ctk.CTkFrame(wrap, fg_color=SURFACE, corner_radius=12)
+        btns.pack(fill="x", pady=(16, 2))
+        btns.grid_columnconfigure(0, weight=1)
+        btns.grid_columnconfigure(1, weight=0)
+        btns.grid_columnconfigure(2, weight=0)
+        btns.grid_columnconfigure(3, weight=0)
+
+        def apply_settings(close_after=False):
             self.auto_run_coding = bool(auto_run_var.get())
             self.enable_typewriter = bool(type_var.get())
             self.persist_session = bool(persist_var.get())
             self.restore_last_file = bool(restore_var.get())
+            self.stop_on_bad_response = bool(stop_bad_var.get())
+            self.require_code_block_for_injection = bool(require_block_var.get())
+            self.shinzen_idle_suggestions_enabled = bool(idle_ideas_var.get())
 
             self.run_mode = run_mode_map.get(run_mode_var.get(), self.run_mode)
             self.insert_mode = insert_map.get(insert_var.get(), self.insert_mode)
+            self.preferred_coding_model = "" if coding_model_var.get() == "(Auto)" else coding_model_var.get()
+            self.preferred_shinzen_model = "" if shinzen_model_var.get() == "(Auto)" else shinzen_model_var.get()
 
-            self.general_max_tokens = self._coerce_int(general_entry.get(), 80, 2400, self.general_max_tokens)
             self.coding_max_tokens = self._coerce_int(coding_entry.get(), 120, 4000, self.coding_max_tokens)
+            self.username = username_entry.get().strip() or "Coder"
             self.run_timeout_sec = self._coerce_int(timeout_entry.get(), 5, 600, self.run_timeout_sec)
+            self.shinzen_feedback_cooldown_sec = self._coerce_int(shinzen_cooldown_entry.get(), 5, 300, self.shinzen_feedback_cooldown_sec)
+            self.shinzen_refresh_timer_sec = self._coerce_int(shinzen_refresh_entry.get(), 10, 300, self.shinzen_refresh_timer_sec)
+            self.shinzen_idle_interval_sec = self._coerce_int(shinzen_idle_entry.get(), 20, 600, self.shinzen_idle_interval_sec)
+            self._schedule_shinzen_analysis(delay=200, force=True)
 
             self._refresh_coding_controls()
             self._update_run_mode_badge()
             self._save_preferences()
             self._set_status_temporary("Settings saved", duration=1800)
-            try:
-                win.destroy()
-            except Exception:
-                pass
+            if close_after:
+                try:
+                    win.destroy()
+                except Exception:
+                    pass
 
-        ctk.CTkButton(btns, text="Cancel", width=90, height=40, fg_color=SURFACE_ALT, hover_color=SOFT, text_color=TEXT, command=win.destroy).pack(side="right", padx=(8, 0))
-        ctk.CTkButton(btns, text="Save", width=90, height=40, fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color="white", command=apply_and_close).pack(side="right")
+        ctk.CTkButton(
+            btns,
+            text="Save",
+            width=92,
+            height=40,
+            corner_radius=14,
+            fg_color="#EAD9CB",
+            hover_color=SOFT,
+            text_color=TEXT,
+            command=lambda: apply_settings(False),
+        ).grid(row=0, column=1, padx=(0, 8), pady=2, sticky="e")
+
+        ctk.CTkButton(
+            btns,
+            text="Save & Close",
+            width=118,
+            height=40,
+            corner_radius=14,
+            fg_color=ACCENT,
+            hover_color=ACCENT_HOVER,
+            text_color="white",
+            command=lambda: apply_settings(True),
+        ).grid(row=0, column=2, padx=(0, 8), pady=2, sticky="e")
+
+        ctk.CTkButton(
+            btns,
+            text="Cancel",
+            width=92,
+            height=40,
+            corner_radius=14,
+            fg_color=SURFACE_ALT,
+            hover_color=SOFT,
+            text_color=TEXT,
+            command=win.destroy,
+        ).grid(row=0, column=3, pady=2, sticky="e")
+
+    def _open_help(self):
+        if self._help_window is not None and self._help_window.winfo_exists():
+            self._help_window.lift()
+            self._help_window.focus_force()
+            return
+
+        win = ctk.CTkToplevel(self)
+        win.title("Code9 Help")
+        win.geometry("760x620")
+        win.configure(fg_color=SURFACE)
+        self._help_window = win
+
+        wrap = ctk.CTkFrame(win, fg_color=SURFACE, corner_radius=0)
+        wrap.pack(fill="both", expand=True, padx=14, pady=14)
+
+        ctk.CTkLabel(
+            wrap,
+            text="How Code9 Works",
+            text_color=TEXT,
+            font=(BASE_FONT[0], 20, "bold"),
+        ).pack(anchor="w", pady=(0, 10))
+
+        help_text = (
+            "AI Assistants\n"
+            "- Coding AI: generates runnable Python, fixes bugs, and can auto-inject code into Engine.\n\n"
+            "- Engine injection guard: malformed Python from AI is blocked before editor updates.\n\n"
+            "Top Buttons\n"
+            "- Open: open a local file into the Engine editor.\n"
+            "- Save / Save As: save current Engine content.\n"
+            "- Run: execute Engine code in temp sandbox or active file mode.\n"
+            "- Stop: stop the running Engine process.\n"
+            "- AI Fill: rewrite selected code (or full editor) from a natural-language instruction.\n"
+            "- Shell: export a launcher script for the current Engine code.\n"
+            "- Ideas: posts project upgrade ideas in the Coding AI chat.\n"
+            "- Settings: controls AI behavior, model choices, and Shinzen timing.\n"
+            "- Help: this guide.\n"
+            "- Clear: clears the chat and restores the welcome prompt.\n\n"
+            "Settings Guide\n"
+            "- Auto-run code from Coding AI: when ON, code gets injected and can run automatically.\n"
+            "- Typewriter animation in chat: cosmetic typing effect in chat responses.\n"
+            "- Persist session draft: auto-saves unsaved editor text to recover on restart.\n"
+            "- Restore last opened file on launch: reopens your previous file path.\n"
+            "- Auto-stop nonsense coding replies: cancels repetitive/low-quality coding output.\n"
+            "- Require fenced code block before injection: safer code insertion from coding replies.\n"
+            "- Enable idle code ideas: Shinzen gives project ideas while you are idle.\n"
+            "- Run Mode: Temp Sandbox isolates runs; Active File runs the saved file directly.\n"
+            "- Code Insert Mode: Replace swaps whole editor; Append adds generated code at end.\n"
+            "- Coding Model: primary model for coding chat and AI Fill.\n"
+            "- Shinzen Comment Model: lightweight model for Shinzen bubble feedback.\n"
+            "- Coding max tokens: max length for coding responses.\n"
+            "- Run timeout (sec): maximum runtime before process is stopped.\n"
+            "- Shinzen cooldown (sec): minimum time between Shinzen comments.\n"
+            "- Shinzen refresh timer (sec): periodic refresh cadence while actively coding.\n"
+            "- Idle suggestion interval (sec): idea cadence while idle.\n\n"
+            "Recommended Settings\n"
+            "- Safe default profile: Auto-run OFF, Require code block ON, Auto-stop nonsense ON, Run Mode Temp Sandbox.\n"
+            "- Fast iteration profile: Auto-run ON, Insert Mode Replace, Run timeout 60, Coding max tokens 700-1000.\n"
+            "- Shinzen profile (balanced): cooldown 20, refresh 30, idle ideas ON, idle interval 60.\n\n"
+            "Model Recommendations\n"
+            "- Best coding quality (current list): mlx-community/Qwen2.5-Coder-7B-Instruct-4bit.\n"
+            "- Good fallback: mlx-community/DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx.\n"
+            "- Lightweight fallback: mlx-community/starcoder2-7b-4bit.\n"
+            "- Best Shinzen/comment quality: mlx-community/Phi-3.5-mini-instruct-4bit.\n"
+            "- Alternative Shinzen fast model: mlx-community/Qwen2.5-1.5B-Instruct-4bit.\n\n"
+            "Coding Card Controls\n"
+            "- Auto Run: run generated coding output immediately after injection.\n"
+            "- Insert mode: replace editor content or append generated code.\n"
+            "- Stop: cancels an in-progress assistant response.\n"
+            "- /Runtime /Engine /Errors /Shinzen: attach context shortcuts for coding prompts.\n\n"
+            "Shinzen Mascot\n"
+            "- Main Shinzen uses the speech bubble as the status indicator.\n"
+            "- Bubble appears for new statuses/comments and hides when idle.\n"
+            "- Peeks while you type, uses slower running animation during code execution.\n\n"
+            "Coding Models (Public)\n"
+            "- Default fallback order: Qwen2.5-Coder-7B, DeepSeek-Coder-V2-Lite, StarCoder2.\n"
+            "- Install runtime: `pip install -U mlx-lm`\n"
+            "- Download by running once in app, or prefetch via: `python -m mlx_lm.generate --model <model-repo> --prompt \"ready\" --max-tokens 1`\n"
+            "- Set preferred model in Settings -> Coding Model."
+        )
+
+        panel = tk.Text(
+            wrap,
+            bg="#FFFCF8",
+            fg=TEXT,
+            bd=0,
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=BORDER,
+            wrap="word",
+            padx=14,
+            pady=12,
+            font=(BASE_FONT[0], 12),
+        )
+        panel.pack(fill="both", expand=True)
+        panel.insert("1.0", help_text)
+        panel.config(state="disabled")
+
+        foot = ctk.CTkFrame(wrap, fg_color=SURFACE, corner_radius=0)
+        foot.pack(fill="x", pady=(10, 0))
+        ctk.CTkButton(
+            foot,
+            text="Close",
+            width=92,
+            corner_radius=14,
+            fg_color=SURFACE_ALT,
+            hover_color=SOFT,
+            text_color=TEXT,
+            command=win.destroy,
+        ).pack(side="right")
+    def _lock_ui(self):
+        self._ui_busy = True
+        self.after(120, self._unlock_ui)
+
+    def _unlock_ui(self):
+        self._ui_busy = False
 
     # -------------------- CHAT HELPERS --------------------
     def _setup_chat_tags(self, widget):
@@ -722,11 +1142,71 @@ class Code9Claude(ctk.CTk):
             widget.tag_config("role", foreground=MUTED, font=(BASE_FONT[0], 10, "bold"), spacing1=6)
             widget.tag_config("user", foreground=TEXT, background="#FCEEE1", lmargin1=8, lmargin2=8, spacing1=2, spacing3=6)
             widget.tag_config("assistant", foreground=TEXT, background="#FFF9F3", lmargin1=8, lmargin2=8, spacing1=2, spacing3=8)
+            widget.tag_config(
+                "welcome",
+                foreground="#AA8F7B" ,
+                justify="center",
+                font=(BASE_FONT[0], 18, "bold"),
+                spacing3=8,
+            )
+        except Exception:
+            pass
+
+    def _next_welcome_message(self):
+        try:
+            if not self._welcome_pool:
+                self._welcome_pool = random.sample(WELCOME_VARIANTS, k=len(WELCOME_VARIANTS))
+            template = self._welcome_pool.pop()
+
+            # Dynamic time check
+            hour = datetime.now().hour
+            if hour < 12:
+                current_greet = "Good morning"
+            elif hour < 18:
+                current_greet = "Good afternoon"
+            else:
+                current_greet = "Good evening"
+
+            # We use 'Username' (Capital U) to match your WELCOME_VARIANTS list
+            return template.format(
+                Username=getattr(self, "username", "Coder"),
+                timedGreeting=current_greet
+            )
+        except Exception as e:
+            print(f"Greeting Error: {e}")
+            return "Welcome back!"
+
+    def _set_chat_welcome(self, widget, kind="coding"):
+        if not widget: return
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
+        
+        # SAFE CHECK: Determine if we are dealing with a CTk wrapper or a raw Text widget
+        target = widget._textbox if hasattr(widget, "_textbox") else widget
+        
+        # Now we can safely configure the font and center the text
+        target.tag_config("welcome", justify="center", font=(BASE_FONT[0], 26, "bold"), foreground="#352922")
+        
+        msg = self._next_welcome_message()
+        
+        # This adds the 5 empty lines to push the text down
+        widget.insert("end", "\n\n\n\n" + msg, "welcome")
+        widget.configure(state="disabled")
+        self._chat_welcome_state[widget] = True
+
+    def _clear_chat_welcome_if_needed(self, widget):
+        try:
+            if self._chat_welcome_state.get(widget):
+                widget.config(state="normal")
+                widget.delete("1.0", "end")
+                widget.config(state="disabled")
+                self._chat_welcome_state[widget] = False
         except Exception:
             pass
 
     def _append_user(self, widget, text):
         try:
+            self._clear_chat_welcome_if_needed(widget)
             widget.config(state="normal")
             widget.insert("end", "You:\n", ("role",))
             start = widget.index("end-1c")
@@ -742,6 +1222,7 @@ class Code9Claude(ctk.CTk):
         """Append assistant text to a chat widget. If request_id is provided, this append is cancelled
         when self.abort_tokens[kind] changes.
         """
+        self._clear_chat_welcome_if_needed(widget)
         safe_text = self._sanitize_text(text)
 
         # If a request id is provided and doesn't match current, skip appending
@@ -815,12 +1296,18 @@ class Code9Claude(ctk.CTk):
             widget.config(state="normal")
             widget.delete("1.0", "end")
             widget.config(state="disabled")
+            self._chat_welcome_state[widget] = False
+            kind = self._chat_widget_kind.get(widget, "general")
+            self._set_chat_welcome(widget, kind=kind)
         except Exception:
             pass
 
     def _copy_from_widget(self, widget):
         """Copy selection if present, else copy the entire widget content to clipboard."""
         try:
+            if self._chat_welcome_state.get(widget):
+                self._set_status_temporary("Nothing to copy", duration=1400)
+                return
             try:
                 sel = widget.get("sel.first", "sel.last")
                 text = sel.strip()
@@ -849,108 +1336,152 @@ class Code9Claude(ctk.CTk):
             return "Model: failed"
         return f"Model: loading ({DEVICE})"
 
+    def _configure_mlx_runtime(self):
+        """Tune MLX Metal runtime limits for steadier throughput when available."""
+        if not (MLX_AVAILABLE and MLX_CORE_AVAILABLE and mx is not None):
+            return
+        try:
+            if hasattr(mx, "metal") and mx.metal.is_available():
+                if hasattr(mx, "device_info"):
+                    info = mx.device_info()
+                elif hasattr(mx.metal, "device_info"):
+                    info = mx.metal.device_info()
+                else:
+                    info = {}
+                rec = int(info.get("max_recommended_working_set_size", 0) or 0)
+                if rec > 0 and hasattr(mx, "set_wired_limit"):
+                    mx.set_wired_limit(int(rec * 0.92))
+        except Exception:
+            pass
+
+    def _load_models_serial(self):
+        """Load coding then Shinzen model sequentially to avoid Metal command-buffer races."""
+        try:
+            self._load_model()
+        except Exception:
+            pass
+        try:
+            self._load_phi_model()
+        except Exception:
+            pass
+
     def _load_model(self):
         try:
-            self.status_label.configure(text=f"Loading model on {DEVICE}...")
-            import inspect
-            sig = inspect.signature(load)
-            kwargs = {}
-            if "device" in sig.parameters:
-                kwargs["device"] = DEVICE
-            model, tokenizer = load("mlx-community/Meta-Llama-3-8B-Instruct-4bit", **kwargs)
-            self.model = model
-            self.tokenizer = tokenizer
-            self.model_ready = True
-            self.model_failed = False
-            # Refresh status (Idle if no active work)
-            self._refresh_status()
+            with self._mlx_load_lock:
+                self.after(0, lambda: self._set_presence_message(f"Loading Coding AI on {DEVICE}...", mood="thinking"))
+                sig = inspect.signature(load)
+                kwargs = {}
+                if "lazy" in sig.parameters:
+                    kwargs["lazy"] = True
+                if "device" in sig.parameters:
+                    kwargs["device"] = DEVICE
+                candidates = []
+                if self.preferred_coding_model:
+                    candidates.append(self.preferred_coding_model)
+                for name in CODING_MODEL_CANDIDATES:
+                    if name not in candidates:
+                        candidates.append(name)
+
+                model, tokenizer, picked, errors = self.model_wrapper.load_first_available(candidates, base_kwargs=kwargs)
+                if model is None or tokenizer is None:
+                    attempts = "; ".join([f"{k}: {v}" for k, v in errors.items()])
+                    raise RuntimeError("No coding model could be loaded. Attempts: " + attempts)
+
+                self.model = model
+                self.tokenizer = tokenizer
+                self.loaded_coding_model_name = picked or ""
+                self.model_ready = True
+                self.model_failed = False
+                self._configure_mlx_runtime()
+
+                short_name = (self.loaded_coding_model_name or "coding model").split("/")[-1]
+                self.after(0, lambda: self._set_presence_message(f"Coding AI loaded: {short_name}. Warming up...", mood="thinking"))
+                try:
+                    self._safe_generate("Reply with exactly: ready", max_tokens=6, temperature=0.0)
+                except Exception:
+                    pass
+                self.after(0, self._refresh_status)
         except Exception as e:
             self.model_ready = False
             self.model_failed = True
-            # Show failure message
-            self._refresh_status()
-            print("Model load error:", e)
+            self.after(0, self._refresh_status)
+            print("Coding model load error:", e)
+
+    def _load_phi_model(self):
+        """Load the fast Phi-3.5-mini model for Shinzen bubble comments."""
+        try:
+            with self._mlx_load_lock:
+                sig = inspect.signature(load)
+                kwargs = {}
+                if "lazy" in sig.parameters:
+                    kwargs["lazy"] = True
+                if "device" in sig.parameters:
+                    kwargs["device"] = DEVICE
+                candidates = []
+                if self.preferred_shinzen_model:
+                    candidates.append(self.preferred_shinzen_model)
+                for name in SHINZEN_MODEL_CANDIDATES:
+                    if name not in candidates:
+                        candidates.append(name)
+                phi_model, phi_tokenizer, picked, _errors = self.model_wrapper.load_first_available(candidates, base_kwargs=kwargs)
+                if phi_model is None or phi_tokenizer is None:
+                    raise RuntimeError("No Shinzen comment model could be loaded.")
+                self.phi_model = phi_model
+                self.phi_tokenizer = phi_tokenizer
+                self.loaded_shinzen_model_name = picked or ""
+                self.phi_ready = True
+                print("Shinzen model ready:", self.loaded_shinzen_model_name)
+        except Exception as e:
+            self.phi_ready = False
+            print("Phi model load error:", e)
 
     def _sanitize_response(self, text, mode=None):
-        """
-        Basic post-processing to reduce self-talk, role markers, and exact repeated lines.
-        For coding mode, also truncate the response after the final code block plus a short concluding paragraph
-        to avoid repeated code dumps or trailing duplicates.
-        """
         try:
-            if not text:
-                return text
-
-            # Remove obvious role markers
-            lines = [ln for ln in text.splitlines() if ln.strip() not in ("User:", "Assistant:", "General AI:", "Coding AI:")]
-            # Collapse consecutive identical lines
-            collapsed = []
-            for ln in lines:
-                if collapsed and ln.strip() == collapsed[-1].strip():
-                    continue
-                collapsed.append(ln)
-            result = "\n".join(collapsed).strip()
-
-            # For coding responses: truncate after last fenced code block and at most one short concluding paragraph
-            if mode == "coding":
-                try:
-                    pattern = r"```([a-zA-Z0-9_+\-]*)\s*\n([\s\S]*?)```"
-                    matches = list(re.finditer(pattern, result))
-                    if matches:
-                        last = matches[-1]
-                        end_idx = last.end()
-                        after = result[end_idx:]
-                        concl = ""
-                        if after.strip():
-                            m = re.search(r"\n\s*\n", after)
-                            if m:
-                                concl = after[: m.start()].strip()
-                            else:
-                                # take first paragraph or up to 600 chars
-                                para = after.strip().splitlines()
-                                if para:
-                                    joined = "\n".join(para[:5])
-                                    concl = joined[:600].strip()
-                        truncated = result[:end_idx]
-                        if concl:
-                            truncated = truncated + "\n\n" + concl
-                        result = truncated
-                except Exception:
-                    pass
-
-            # If the model repeats an entire paragraph multiple times, keep only first occurrence
-            paras = [p.strip() for p in re.split(r"\n\s*\n", result) if p.strip()]
-            dedup_paras = []
-            for p in paras:
-                if dedup_paras and p == dedup_paras[-1]:
-                    continue
-                dedup_paras.append(p)
-            final = "\n\n".join(dedup_paras)
-
-            # As a final safeguard, if the entire text is repeated multiple times, keep only one occurrence
-            # e.g., 'A A A' long repeats
-            if len(final) > 200:
-                half = final[: len(final) // 2]
-                if half in final[len(half) :]:
-                    # keep only first occurrence
-                    final = final[: len(final) // 2]
-
-            return final
+            return ChatSanitizer.sanitize_response(text or "", mode=mode)
         except Exception:
             return text
 
+    def _safe_generate_mlx(self, prompt, max_tokens, temperature=None):
+        call_kwargs = {"prompt": prompt, "max_tokens": max_tokens}
+        temp = self.safe_defaults.get("temperature", 0.0) if temperature is None else temperature
+
+        if make_sampler is not None:
+            call_kwargs["sampler"] = make_sampler(
+                temp=float(temp),
+                top_p=float(self.safe_defaults.get("top_p", 0.0)),
+                top_k=int(self.safe_defaults.get("top_k", 0)),
+            )
+
+        if make_logits_processors is not None:
+            rep = float(self.safe_defaults.get("repetition_penalty", 1.0))
+            if rep > 1.0:
+                logits_processors = make_logits_processors(
+                    repetition_penalty=rep,
+                    repetition_context_size=24,
+                )
+                if logits_processors:
+                    call_kwargs["logits_processors"] = logits_processors
+
+        for key in ("prefill_step_size", "max_kv_size", "kv_bits", "kv_group_size", "quantized_kv_start"):
+            value = self.safe_defaults.get(key)
+            if value is not None:
+                call_kwargs[key] = value
+
+        return generate(self.model, self.tokenizer, **call_kwargs)
+
     def _safe_generate(self, prompt, max_tokens, temperature=None):
-        """Call the underlying generate function with conservative decoding params when supported.
-        The function detects common parameter names and falls back gracefully.
-        """
+        """Call generation with backend-aware defaults and robust fallbacks."""
         try:
-            import inspect
+            if getattr(generate, "__module__", "").startswith("mlx_lm"):
+                return self._safe_generate_mlx(prompt, max_tokens, temperature=temperature)
+
             sig = inspect.signature(generate)
             params = sig.parameters
+            accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
             call_kwargs = {}
 
             # Prompt/input naming
-            if "prompt" in params:
+            if "prompt" in params or accepts_kwargs:
                 call_kwargs["prompt"] = prompt
             elif "inputs" in params:
                 call_kwargs["inputs"] = prompt
@@ -958,7 +1489,7 @@ class Code9Claude(ctk.CTk):
                 call_kwargs["prompt"] = prompt
 
             # Max tokens naming
-            if "max_tokens" in params:
+            if "max_tokens" in params or accepts_kwargs:
                 call_kwargs["max_tokens"] = max_tokens
             elif "max_new_tokens" in params:
                 call_kwargs["max_new_tokens"] = max_tokens
@@ -968,19 +1499,19 @@ class Code9Claude(ctk.CTk):
             # Decoding defaults (favor deterministic/stable outputs)
             # Allow an override temperature to be passed explicitly
             if temperature is None:
-                if "temperature" in params:
+                if "temperature" in params or accepts_kwargs:
                     call_kwargs["temperature"] = 0.0
             else:
-                if "temperature" in params:
+                if "temperature" in params or accepts_kwargs:
                     call_kwargs["temperature"] = temperature
 
-            if "top_p" in params:
-                call_kwargs["top_p"] = 0.8
-            if "repetition_penalty" in params:
-                call_kwargs["repetition_penalty"] = 1.4
+            if "top_p" in params or accepts_kwargs:
+                call_kwargs["top_p"] = 0.2
+            if "repetition_penalty" in params or accepts_kwargs:
+                call_kwargs["repetition_penalty"] = 1.2
 
             # Add stop sequences if supported to reduce run-on replies
-            if "stop" in params:
+            if "stop" in params or accepts_kwargs:
                 call_kwargs["stop"] = ["\n\nAssistant:", "\n\nYou:", "\n\nUser:"]
 
             # Some generate signatures expect (model, tokenizer, **kwargs)
@@ -1000,7 +1531,7 @@ class Code9Claude(ctk.CTk):
         If verifier is not enabled or model unavailable, returns empty string.
         """
         try:
-            if (not MLX_AVAILABLE) or (not self.model_ready) or (not getattr(self, "enable_verifier", True)):
+            if (not MLX_AVAILABLE) or (not self.model_ready) or (not getattr(self, "enable_verifier", False)):
                 return ""
 
             verify_prompt = (
@@ -1019,6 +1550,12 @@ class Code9Claude(ctk.CTk):
             return "\n\n[Verifier notes]:\n" + cleaned
         except Exception:
             return ""
+
+    def _is_nonsense_response(self, text, mode="coding"):
+        try:
+            return ChatSanitizer.is_nonsense(text or "", mode=mode)
+        except Exception:
+            return False
 
     def _generate_text(self, prompt, max_tokens, mode="general"):
         # Local fallback when model is unavailable
@@ -1040,42 +1577,74 @@ class Code9Claude(ctk.CTk):
             # This runs with conservative limits and appends a short note if anything questionable is found.
             note = ""
             try:
-                if getattr(self, "enable_verifier", True):
+                if getattr(self, "enable_verifier", False):
                     note = self._run_verifier(raw, mode)
             except Exception:
                 note = ""
 
-            return self._sanitize_response((raw or "") + (note or ""), mode=mode)
+            cleaned = self._sanitize_response((raw or "") + (note or ""), mode=mode)
+
+            if mode == "coding" and self.stop_on_bad_response and self._is_nonsense_response(cleaned, mode="coding"):
+                retry_prompt = (
+                    prompt
+                    + "\n\nSTRICT OUTPUT FIX:\n"
+                    "- No repeated lines.\n"
+                    "- Reply with one fenced ```python block only.\n"
+                    "- No role labels, no repeated commentary.\n"
+                )
+                retry_raw = self._safe_generate(retry_prompt, max_tokens=min(max_tokens, 900), temperature=0.0)
+                retry_clean = self._sanitize_response(retry_raw or "", mode=mode)
+                if self._is_nonsense_response(retry_clean, mode="coding"):
+                    return (
+                        "```python\n"
+                        "# Coding AI stopped: response looked invalid or repetitive.\n"
+                        "print('Coding AI stopped due to low-quality output. Please retry.')\n"
+                        "```"
+                    )
+                return retry_clean
+
+            return cleaned
         except Exception as e:
             if mode == "coding":
                 return f"```python\n# Generation error\nprint({repr(str(e))})\n```"
             return f"Generation error: {e}"
 
-    # -------------------- ASK HANDLERS --------------------
-    def _on_general_ask_clicked(self):
-        self.ask_general_ai()
+    def _build_coding_repair_prompt(self, query, raw_response, issue):
+        issue_text = issue or "Output format did not pass validation."
+        return (
+            "You are repairing a Python coding assistant response.\n"
+            "Return one fenced ```python block only.\n"
+            "Rules:\n"
+            "- The code must parse in Python.\n"
+            "- Keep behavior aligned to the request.\n"
+            "- No role labels and no extra markdown.\n\n"
+            f"User request:\n{query}\n\n"
+            f"Validation issue:\n{issue_text}\n\n"
+            "Original response:\n"
+            f"{raw_response}\n\n"
+            "Repaired response:"
+        )
 
+    def _normalize_coding_response(self, text):
+        try:
+            return ChatSanitizer.normalize_coding_reply(
+                text or "",
+                require_code_block=bool(self.require_code_block_for_injection),
+            )
+        except Exception:
+            return {
+                "response_text": (text or "").strip(),
+                "code": "",
+                "syntax_ok": False,
+                "had_code_block": False,
+                "needs_retry": True,
+                "issue": "Could not normalize coding output.",
+                "quality_score": 0,
+            }
+
+    # -------------------- ASK HANDLERS --------------------
     def _on_coding_ask_clicked(self):
         self.ask_coding_ai()
-
-    def ask_general_ai(self, event=None):
-        query = self.general_card["var"].get().strip()
-        if not query:
-            return
-
-        # increment request token and capture it for cancellation checks
-        try:
-            self.abort_tokens['general'] = self.abort_tokens.get('general', 0) + 1
-            req_id = self.abort_tokens['general']
-        except Exception:
-            req_id = None
-
-        self._append_user(self.general_card["text"], query)
-        self.general_card["var"].set("")
-        self.start_loader()
-        self.status_label.configure(text="General AI thinking...")
-
-        threading.Thread(target=self._general_worker, args=(query, req_id), daemon=True).start()
 
     def ask_coding_ai(self, event=None):
         # Read the entry but strip the visual prefix (if present) so attachments remain visible in the entry
@@ -1102,6 +1671,8 @@ class Code9Claude(ctk.CTk):
                         self._attach_editor_to_coding()
                     elif tl.startswith("gen"):
                         self._attach_general_chat_to_coding()
+                    elif tl.startswith("shin"):
+                        self._attach_shinzen_to_coding()
                 # remove tags from value
                 # strip all /word tokens
                 leading = re.sub(r"/\w+", "", leading).strip()
@@ -1133,53 +1704,54 @@ class Code9Claude(ctk.CTk):
             var.set(prefix)
         else:
             var.set("")
-        self.start_loader()
-        self.status_label.configure(text="Coding AI generating...")
+        if self.model_ready:
+            self.start_loader()
+        self._set_presence_message("Coding AI is crafting code...", mood="thinking")
+
+        # Pause Shinzen suggestions while user is explicitly asking so it doesn't interrupt.
+        try:
+            self._pause_shinzen()
+        except Exception:
+            pass
 
         threading.Thread(target=self._coding_worker, args=(query, req_id), daemon=True).start()
 
-    def _general_worker(self, query, req_id=None):
-        prompt = (
-            "You are Code9's all-purpose assistant. "
-            "Be warm, clear, practical, and concise. "
-            "Do not invent facts — if you do not know, say 'I don't know' and suggest how to verify. "
-            "If the user asks technical questions, answer directly and offer actionable next steps.\n\n"
-            f"User:\n{query}\n\nAssistant:"
-        )
-
-        try:
-            resp = self._generate_text(prompt=prompt, max_tokens=self.general_max_tokens, mode="general")
-            # If request was cancelled while generating, don't display
-            if req_id is not None and req_id != self.abort_tokens.get('general'):
-                self.after(0, lambda: self._set_status_temporary("General AI response cancelled", duration=1200))
-            else:
-                self.after(0, lambda r=resp, rid=req_id: self._append_assistant(self.general_card["text"], r, label="General AI", kind="general", request_id=rid))
-        finally:
-            self.after(0, self.stop_loader)
-            self.after(0, self._refresh_status)
-
     def _coding_worker(self, query, req_id=None):
+        self.after(0, self._lock_ui)
         editor_snapshot = self.editor.get("1.0", "end-1c")
         # Include any attached resources into the prompt so the model can use them.
         attachments_text = ""
         try:
             if self.coding_attachments:
                 attachments_text = "Attached resources:\n\n" + "\n\n".join(self.coding_attachments.values()) + "\n\n"
+            # Optionally include Shinzen suggestions automatically into the prompt
+            if getattr(self, 'include_shinzen_in_coding', True):
+                try:
+                    shin_txt = (getattr(self, "_last_shinzen_comment", "") or "").strip()
+                    if not shin_txt:
+                        shin_txt_widget = getattr(self, 'shinzen_bubble_text', None) or getattr(self, 'shinzen_suggestions', None)
+                        if shin_txt_widget is not None:
+                            shin_txt = shin_txt_widget.get('1.0', 'end-1c').strip()
+                    shin_payload = AttachmentManager.prepare_shinzen_snippet(shin_txt, max_chars=320)
+                    if shin_payload:
+                        attachments_text = (shin_payload + "\n\n") + attachments_text
+                except Exception:
+                    pass
         except Exception:
             attachments_text = ""
 
         prompt = (
-            "You are Code9's coding assistant. "
-            "Provide a brief explanation and include runnable Python in fenced code blocks when code is needed. "
-            "If multiple files are needed, clearly label each block. "
-            "Do not invent file contents or external facts — if unsure, say you don't know. "
-            "Do not give extranious unused code. "
-            "Do not role-play another assistant or talk to yourself.\n\n"
+            "You are a Python coding assistant. Be concise and direct.\n"
+            "Rules:\n"
+            "- Return exactly one runnable Python fenced ```python block.\n"
+            "- One brief sentence of explanation max — no preamble, no filler.\n"
+            "- Do not repeat the user's question or describe what you're about to do.\n"
+            "- Only include code that is actually used.\n\n"
             f"{attachments_text}"
             "Current engine code:\n"
-            f"```python\n{editor_snapshot[:6000]}\n```\n\n"
-            f"User request:\n{query}\n\n"
-            "Assistant:"
+            f"```python\n{editor_snapshot[:4200]}\n```\n\n"
+            f"Request: {query}\n\n"
+            "Response:"
         )
 
         try:
@@ -1189,39 +1761,64 @@ class Code9Claude(ctk.CTk):
                 self.after(0, lambda: self._set_status_temporary("Coding AI response cancelled", duration=1200))
                 return
 
-            code_candidates = self._extract_code_blocks(resp)
+            normalized = self._normalize_coding_response(resp)
+            if normalized.get("needs_retry"):
+                try:
+                    repair_prompt = self._build_coding_repair_prompt(query, resp, normalized.get("issue"))
+                    repaired = self._generate_text(
+                        prompt=repair_prompt,
+                        max_tokens=min(self.coding_max_tokens, 900),
+                        mode="coding",
+                    )
+                    repaired_norm = self._normalize_coding_response(repaired)
+                    should_use_repair = (
+                        repaired_norm.get("syntax_ok")
+                        and (
+                            (not normalized.get("syntax_ok"))
+                            or int(repaired_norm.get("quality_score", 0)) >= int(normalized.get("quality_score", 0))
+                        )
+                    )
+                    if should_use_repair:
+                        resp = repaired
+                        normalized = repaired_norm
+                except Exception:
+                    pass
 
-            self.after(0, lambda r=resp, rid=req_id: self._append_assistant(self.coding_card["text"], r, label="Coding AI", kind="coding", request_id=rid))
+            display_text = normalized.get("response_text") or self._sanitize_response(resp, mode="coding")
 
-            if code_candidates:
-                selected = code_candidates[-1]
-                self.after(0, lambda c=selected: self._inject_code_into_engine(c))
+            if self.stop_on_bad_response and self._is_nonsense_response(display_text, mode="coding"):
+                self.after(0, lambda: self._append_assistant(self.coding_card["text"], "Stopped: coding output looked repetitive or invalid. Try a shorter, more specific prompt.", label="Coding AI"))
+                self.after(0, lambda: self._set_status_temporary("Stopped low-quality coding reply", duration=1800))
+                return
+
+            self.after(
+                0,
+                lambda r=display_text, rid=req_id: self._append_assistant(
+                    self.coding_card["text"], r, label="Coding AI", kind="coding", request_id=rid
+                ),
+            )
+
+            injectable_code = normalized.get("code") or ""
+            if injectable_code:
+                self.after(0, lambda c=injectable_code: self._inject_code_into_engine(c))
             else:
-                self.after(0, lambda: self._set_status_temporary("No code block found in coding reply", duration=2200))
+                issue = normalized.get("issue") or "No valid Python output found."
+                self.after(0, lambda msg=issue: self._set_status_temporary(f"Injection skipped: {msg}", duration=2400))
+                self.after(0, lambda: self._set_presence_message("I kept your engine safe from malformed code.", mood="concern", duration=2300))
         finally:
+            # Resume Shinzen suggestions after coding response handling completes
+            try:
+                self.after(0, self._resume_shinzen)
+            except Exception:
+                pass
             self.after(0, self.stop_loader)
             self.after(0, self._refresh_status)
 
     def _extract_code_blocks(self, text):
-        blocks = []
         try:
-            pattern = r"```([a-zA-Z0-9_+\-]*)\s*\n([\s\S]*?)```"
-            all_blocks = []
-            for match in re.finditer(pattern, text):
-                lang = (match.group(1) or "").strip().lower()
-                code = (match.group(2) or "").strip()
-                if code:
-                    all_blocks.append((lang, code + "\n"))
-
-            if all_blocks:
-                py_blocks = [code for lang, code in all_blocks if lang in {"", "python", "py"}]
-                return py_blocks if py_blocks else [code for _, code in all_blocks]
-
-            if self._looks_like_python(text):
-                blocks.append(text.strip() + "\n")
+            return ChatSanitizer.extract_code_blocks(text or "")
         except Exception:
-            pass
-        return blocks
+            return []
 
     def _looks_like_python(self, text):
         if "\n" not in text:
@@ -1232,6 +1829,15 @@ class Code9Claude(ctk.CTk):
 
     def _inject_code_into_engine(self, code):
         normalized = code if code.endswith("\n") else (code + "\n")
+        try:
+            compile(normalized, "<ai_injection>", "exec")
+        except Exception as e:
+            self._set_status_temporary(f"Injection skipped: invalid Python ({e})", duration=2600)
+            self._set_presence_message("I blocked malformed code before it reached Engine.", mood="alert", duration=2500)
+            return False
+
+        before = self.editor.get("1.0", "end-1c")
+        self._last_ai_injection = before
 
         if self.insert_mode == "append":
             current = self.editor.get("1.0", "end-1c")
@@ -1244,13 +1850,16 @@ class Code9Claude(ctk.CTk):
         self._highlight_syntax()
         self._mark_editor_dirty()
         self._schedule_session_autosave()
+        self._schedule_shinzen_analysis(delay=140, force=True)
 
         if self.auto_run_coding:
+            self.after(0, self._open_runtime_terminal)
             code_to_run = self.editor.get("1.0", "end-1c")
             threading.Thread(target=self._run_code, args=(code_to_run, False), daemon=True).start()
             self._set_status_temporary("Injected code into engine and started run", duration=2200)
         else:
             self._set_status_temporary("Injected code into engine", duration=1800)
+        return True
 
     # -------------------- RUN / ENGINE --------------------
     def _run_code(self, code, manage_loader=False):
@@ -1261,6 +1870,8 @@ class Code9Claude(ctk.CTk):
         except Exception as e:
             self.after(0, self._clear_output_panel)
             self.after(0, lambda: self._append_output(f"Syntax error:\n{e}\n"))
+            self.after(0, lambda: self._set_presence_message("Syntax error found before run.", mood="alert", duration=2400))
+            self.after(0, lambda: self._schedule_shinzen_analysis(delay=80, force=True))
             if manage_loader:
                 self.after(0, self.stop_loader)
             return
@@ -1291,15 +1902,17 @@ class Code9Claude(ctk.CTk):
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
 
+        self.after(0, self._open_runtime_terminal)
         self.after(0, self._clear_output_panel)
         self.after(0, lambda: self._append_output(f"[Run started {time.strftime('%H:%M:%S')}]\n$ {' '.join(cmd)}\n\n"))
-        self.after(0, lambda: self.status_label.configure(text="Running engine code..."))
+        self.after(0, lambda: self._set_presence_message("Running engine code...", mood="running"))
 
         try:
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                stdin=subprocess.PIPE,
                 text=True,
                 cwd=run_cwd,
                 env=env,
@@ -1336,6 +1949,11 @@ class Code9Claude(ctk.CTk):
 
             rc = proc.returncode
             self.after(0, lambda: self._append_output(f"\n[Process exited with code {rc}]\n"))
+            if rc == 0:
+                self.after(0, lambda: self._set_presence_message("Run finished cleanly.", mood="happy", duration=1800))
+            else:
+                self.after(0, lambda: self._set_presence_message("Run finished with errors.", mood="concern", duration=2200))
+            self.after(0, lambda: self._schedule_shinzen_analysis(delay=120, force=True))
         except Exception:
             tb = traceback.format_exc()
             self.after(0, lambda txt=tb: self._append_output("\n" + txt + "\n"))
@@ -1352,34 +1970,552 @@ class Code9Claude(ctk.CTk):
 
     def _append_output(self, text):
         try:
-            self.output_text.config(state="normal")
+            if getattr(self, "output_text", None) is None:
+                return
             self.output_text.insert("end", text)
             self.output_text.see("end")
-            self.output_text.config(state="disabled")
         except Exception:
             pass
 
     def _clear_output_panel(self):
         try:
-            self.output_text.config(state="normal")
-            self.output_text.delete("1.0", "end")
-            self.output_text.config(state="disabled")
+            if getattr(self, "output_text", None) is not None:
+                self.output_text.delete("1.0", "end")
         except Exception:
             pass
+
+    def _on_terminal_input(self, event):
+        try:
+            if getattr(self, "terminal_input", None) is None:
+                return
+            user_input = self.terminal_input.get()
+            if user_input.strip():
+                self._append_output(f"$ {user_input}\n")
+                self.terminal_input.delete(0, "end")
+                self._set_presence_message("Sent input to the running process.", mood="listening", duration=1600)
+                if self.current_proc and self.current_proc.poll() is None:
+                    try:
+                        self.current_proc.stdin.write(user_input + "\n")
+                        self.current_proc.stdin.flush()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _open_runtime_terminal(self):
+        # Create or focus a non-modal runtime terminal popup and wire input/output
+        try:
+            if getattr(self, "_runtime_win", None) is not None and self._runtime_win.winfo_exists():
+                try:
+                    self._runtime_win.lift()
+                    self._runtime_win.focus_force()
+                    if getattr(self, "_runtime_text", None) is not None:
+                        self.output_text = self._runtime_text
+                    if getattr(self, "_runtime_entry", None) is not None:
+                        self.terminal_input = self._runtime_entry
+                    return
+                except Exception:
+                    pass
+
+            win = ctk.CTkToplevel(self)
+            win.title("Runtime Terminal")
+            win.geometry("780x420")
+            win.configure(fg_color=OUTPUT_BG)
+            win.resizable(True, True)
+            self._runtime_win = win
+
+            frame = ctk.CTkFrame(win, fg_color=OUTPUT_BG, corner_radius=16, border_width=1, border_color=BORDER)
+            frame.pack(fill="both", expand=True, padx=8, pady=8)
+
+            text = tk.Text(
+                frame,
+                font=(MONO_FONT[0], 11),
+                bg=OUTPUT_BG,
+                fg=TEXT,
+                insertbackground=TEXT,
+                bd=0,
+                relief="flat",
+                highlightthickness=0,
+                wrap="word",
+                padx=12,
+                pady=10,
+                state="normal",
+            )
+            text.pack(fill="both", expand=True, padx=8, pady=(8, 4))
+
+            input_frame = ctk.CTkFrame(frame, fg_color=OUTPUT_BG, corner_radius=12)
+            input_frame.pack(fill="x", pady=(6, 6), padx=8)
+
+            prompt_label = ctk.CTkLabel(
+                input_frame,
+                text="$ ",
+                font=(MONO_FONT[0], 11),
+                text_color=ACCENT,
+                fg_color=OUTPUT_BG,
+            )
+            prompt_label.pack(side="left", padx=(6, 4))
+
+            entry = ctk.CTkEntry(
+                input_frame,
+                font=(MONO_FONT[0], 11),
+                fg_color="#FFF7F0",
+                border_width=0,
+                corner_radius=12,
+                text_color=TEXT,
+            )
+            entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+            entry.bind("<Return>", self._on_terminal_input)
+
+            # Keep references so other methods can write to them
+            self._runtime_text = text
+            self._runtime_entry = entry
+            self.output_text = self._runtime_text
+            self.terminal_input = self._runtime_entry
+
+            def on_close():
+                try:
+                    win.destroy()
+                except Exception:
+                    pass
+                self._runtime_win = None
+                self._runtime_text = None
+                self._runtime_entry = None
+                # fallback to inline widgets so attachment actions still work
+                self.output_text = getattr(self, "inline_output_text", self.output_text)
+                self.terminal_input = getattr(self, "inline_terminal_input", self.terminal_input)
+
+            win.protocol("WM_DELETE_WINDOW", on_close)
+            return
+        except Exception:
+            return
 
     def _kill_current_proc(self):
         proc = getattr(self, "current_proc", None)
         if proc and proc.poll() is None:
             try:
                 proc.terminate()
+            except Exception:
                 try:
-                    proc.wait(timeout=1)
-                except Exception:
                     proc.kill()
-                self._append_output("\n[Process killed by user]\n")
+                except Exception:
+                    pass
+
+    # -------------------- Shinzen analysis --------------------
+    def _schedule_shinzen_analysis(self, delay=800, force=False, idle_hint=False):
+        try:
+            # do not schedule while paused
+            if getattr(self, '_shinzen_paused', False):
+                return
+            if hasattr(self, "_shinzen_job") and self._shinzen_job is not None:
+                try:
+                    self.after_cancel(self._shinzen_job)
+                except Exception:
+                    pass
+            self._shinzen_force_refresh = bool(force)
+            self._shinzen_idle_hint = bool(idle_hint)
+            self._shinzen_job = self.after(delay, self._run_shinzen_analysis)
+        except Exception:
+            pass
+
+    def _start_shinzen_loop(self):
+        try:
+            if self._shinzen_periodic_job is not None:
+                try:
+                    self.after_cancel(self._shinzen_periodic_job)
+                except Exception:
+                    pass
+                self._shinzen_periodic_job = None
+            self._shinzen_periodic_job = self.after(1000, self._shinzen_periodic_tick)
+        except Exception:
+            pass
+
+    def _shinzen_periodic_tick(self):
+        try:
+            self._shinzen_periodic_job = None
+            if getattr(self, "_shinzen_paused", False):
+                self._shinzen_periodic_job = self.after(1000, self._shinzen_periodic_tick)
+                return
+            now = time.time()
+            is_idle = self._shinzen_is_idle()
+            since_comment = now - float(getattr(self, "_last_shinzen_comment_ts", 0.0) or 0.0)
+            if is_idle and self.shinzen_idle_suggestions_enabled:
+                if (now - self._last_idle_suggestion_ts) >= max(20, int(self.shinzen_idle_interval_sec)):
+                    self._last_idle_suggestion_ts = now
+                    self._schedule_shinzen_analysis(delay=10, force=True, idle_hint=True)
+            elif (not is_idle) and since_comment >= max(10, int(self.shinzen_refresh_timer_sec)):
+                self._schedule_shinzen_analysis(delay=10, force=False, idle_hint=False)
+        except Exception:
+            pass
+        finally:
+            try:
+                if self._shinzen_periodic_job is None:
+                    self._shinzen_periodic_job = self.after(1000, self._shinzen_periodic_tick)
             except Exception:
                 pass
-        self.current_proc = None
+
+    def _shinzen_is_idle(self):
+        try:
+            return (time.time() - float(getattr(self, "_last_typing_ts", 0.0) or 0.0)) >= float(self.shinzen_idle_threshold_sec)
+        except Exception:
+            return False
+
+    def _safe_generate_phi(self, prompt, max_tokens=80):
+        """Generate a short comment using the Phi model (Shinzen only)."""
+        try:
+            if not self.phi_ready or self.phi_model is None:
+                return ""
+            call_kwargs = {"prompt": prompt, "max_tokens": max_tokens}
+            if make_sampler is not None:
+                call_kwargs["sampler"] = make_sampler(temp=0.45, top_p=0.85, top_k=0)
+            return generate(self.phi_model, self.phi_tokenizer, **call_kwargs)
+        except Exception:
+            return ""
+
+    def _run_shinzen_analysis(self):
+        try:
+            if getattr(self, '_shinzen_paused', False):
+                return
+            if getattr(self, "_shinzen_analysis_inflight", False):
+                return
+
+            code = self.editor.get("1.0", "end-1c").strip()
+            if not code:
+                self._set_shinzen_suggestion("Engine is empty. Add code and I will review it.", mood="listening", duration=6200)
+                return
+
+            now = time.time()
+            force = bool(getattr(self, "_shinzen_force_refresh", False))
+            idle_hint = bool(getattr(self, "_shinzen_idle_hint", False))
+            digest = str(hash(code))
+            cooldown = max(5, int(getattr(self, "shinzen_feedback_cooldown_sec", 20)))
+            since_comment = now - float(getattr(self, "_last_shinzen_comment_ts", 0.0) or 0.0)
+            if since_comment < cooldown:
+                return
+            if (not force) and (not idle_hint) and digest == self._last_shinzen_digest:
+                return
+
+            self._shinzen_analysis_inflight = True
+            self._shinzen_force_refresh = False
+            self._shinzen_idle_hint = False
+
+            # Run on a background thread so we don't block the UI
+            threading.Thread(
+                target=self._run_shinzen_analysis_bg,
+                args=(code, digest, idle_hint),
+                daemon=True,
+            ).start()
+        except Exception:
+            pass
+
+    def _collect_engine_diagnostics(self, code):
+        issues = []
+        ideas = []
+        summary = []
+        lines = code.splitlines()
+        line_count = len(lines)
+        long_lines = sum(1 for ln in lines if len(ln) > 110)
+        todo_count = len(re.findall(r"\b(?:todo|fixme)\b", code, flags=re.IGNORECASE))
+        bare_except_count = len(re.findall(r"except\s*:", code))
+        wildcard_import_count = len(re.findall(r"from\s+\S+\s+import\s+\*", code))
+        print_count = len(re.findall(r"\bprint\s*\(", code))
+        has_main_guard = bool(re.search(r'if\s+__name__\s*==\s*["\']__main__["\']\s*:', code))
+        summary.append(f"{line_count} lines")
+        summary.append(f"{print_count} print call(s)")
+
+        syntax_error = ""
+        function_count = 0
+        class_count = 0
+        missing_docstrings = 0
+        try:
+            tree = ast.parse(code)
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    function_count += 1
+                    if ast.get_docstring(node) is None:
+                        missing_docstrings += 1
+                elif isinstance(node, ast.ClassDef):
+                    class_count += 1
+                    if ast.get_docstring(node) is None:
+                        missing_docstrings += 1
+            summary.append(f"{function_count} function(s), {class_count} class(es)")
+        except SyntaxError as e:
+            syntax_error = f"Syntax error at line {getattr(e, 'lineno', '?')}: {getattr(e, 'msg', str(e))}"
+            issues.append(syntax_error)
+
+        if long_lines:
+            issues.append(f"{long_lines} long line(s) over 110 characters.")
+        if todo_count:
+            issues.append(f"{todo_count} TODO/FIXME note(s) still in the file.")
+        if bare_except_count:
+            issues.append("Bare `except:` found; use specific exceptions.")
+        if wildcard_import_count:
+            issues.append("Wildcard import detected; prefer explicit imports.")
+        if missing_docstrings >= 2:
+            ideas.append("Add brief docstrings to functions/classes to improve maintainability.")
+        if print_count >= 6:
+            ideas.append("Consider switching repeated print statements to logging.")
+        if (not has_main_guard) and function_count > 0:
+            ideas.append("Add an `if __name__ == '__main__':` runner entry for clearer execution.")
+        if not issues and not ideas:
+            ideas.append("Code is stable right now; next step could be adding small tests for key paths.")
+
+        return {
+            "summary": ", ".join(summary),
+            "issues": issues[:4],
+            "ideas": ideas[:4],
+            "syntax_error": syntax_error,
+            "line_count": line_count,
+        }
+
+    def _fallback_shinzen_message(self, diagnostics, idle_hint=False):
+        issues = diagnostics.get("issues", [])
+        ideas = diagnostics.get("ideas", [])
+        syntax_error = diagnostics.get("syntax_error", "")
+        if idle_hint:
+            seed = ideas or self.project_ideas
+            return random.choice(seed)
+        if syntax_error:
+            return f"{syntax_error}. Fix that first."
+        if issues:
+            return "Focus now: " + issues[0]
+        if ideas:
+            return "Next upgrade: " + ideas[0]
+        return "Code looks healthy. Next step: add one targeted test."
+
+    def _shorten_shinzen_tip(self, text, max_chars=96):
+        val = (text or "").strip()
+        if not val:
+            return ""
+
+        val = re.sub(r"\s+", " ", val).strip()
+        parts = re.split(r"(?<=[.!?])\s+", val)
+        short = parts[0].strip() if parts else val
+
+        if len(short) > max_chars:
+            short = short[:max_chars].rstrip()
+            if " " in short:
+                short = short.rsplit(" ", 1)[0]
+            short = short.rstrip(",;:-") + "..."
+        return short
+
+    def _shinzen_feedback_mood(self, diagnostics, idle_hint=False):
+        if idle_hint:
+            return "idea"
+        if diagnostics.get("syntax_error"):
+            return "alert"
+        if diagnostics.get("issues"):
+            return "concern"
+        if diagnostics.get("ideas"):
+            return "explain"
+        return "happy"
+
+    def _low_quality_shinzen_text(self, text):
+        s = (text or "").strip()
+        if len(s) < 12:
+            return True
+        low = s.lower()
+        if low.count("shinzen") > 2:
+            return True
+        # repeated lines or loops are typically low quality in the bubble
+        lines = [ln.strip().lower() for ln in s.splitlines() if ln.strip()]
+        if len(lines) >= 2 and len(set(lines)) <= max(1, len(lines) // 2):
+            return True
+        words = re.findall(r"[a-zA-Z_]{3,}", low)
+        if words:
+            top = max(words.count(w) for w in set(words))
+            if top >= 7:
+                return True
+        return False
+
+    def _run_shinzen_analysis_bg(self, code, digest, idle_hint=False):
+        """Background Shinzen analysis — uses Phi model if ready, else static checks."""
+        try:
+            if getattr(self, '_shinzen_paused', False):
+                return
+
+            diagnostics = self._collect_engine_diagnostics(code)
+            fallback = self._fallback_shinzen_message(diagnostics, idle_hint=idle_hint)
+            final = fallback
+
+            if self.phi_ready:
+                try:
+                    mode_text = "idle idea mode" if idle_hint else "live coding feedback mode"
+                    issues = diagnostics.get("issues", [])
+                    ideas = diagnostics.get("ideas", [])
+                    short_code = code[:2600]
+                    phi_prompt = (
+                        "You are Shinzen, an expert and friendly Python coding coach inside an IDE.\n"
+                        f"Mode: {mode_text}.\n"
+                        "Rules:\n"
+                        "- Be specific and useful.\n"
+                        "- Exactly one short sentence.\n"
+                        "- Keep it under 16 words.\n"
+                        "- No role labels, no disclaimers, no repeating phrases.\n"
+                        "- If syntax error exists, prioritize the fix.\n\n"
+                        f"Engine summary: {diagnostics.get('summary', '')}\n"
+                        f"Issues: {' | '.join(issues) if issues else 'none'}\n"
+                        f"Ideas: {' | '.join(ideas) if ideas else 'none'}\n\n"
+                        f"Code:\n```python\n{short_code}\n```\n\n"
+                        "Shinzen response:"
+                    )
+                    ai_comment = self._safe_generate_phi(phi_prompt, max_tokens=90)
+                    ai_comment = self._sanitize_response(ai_comment, mode="general").strip()
+                    ai_comment = re.sub(r"^Shinzen(?: response)?:\s*", "", ai_comment, flags=re.IGNORECASE).strip()
+                    if ai_comment and (not self._low_quality_shinzen_text(ai_comment)):
+                        final = ai_comment
+                except Exception:
+                    final = fallback
+
+            final = self._shorten_shinzen_tip(final, max_chars=96)
+            final = self._sanitize_text(final.strip(), limit=120, keep=70)
+            if not final:
+                final = self._shorten_shinzen_tip(fallback, max_chars=96)
+
+            mood = self._shinzen_feedback_mood(diagnostics, idle_hint=idle_hint)
+            issue_count = len(diagnostics.get("issues", []))
+
+            def apply_shinzen_result():
+                self._set_shinzen_suggestion(final, mood=mood, duration=8200)
+                self._last_shinzen_comment = final
+                self._last_shinzen_comment_ts = time.time()
+                self._last_shinzen_issue_count = issue_count
+                if not idle_hint:
+                    self._last_shinzen_digest = digest
+
+            self.after(0, apply_shinzen_result)
+        except Exception:
+            pass
+        finally:
+            try:
+                self.after(0, lambda: setattr(self, "_shinzen_analysis_inflight", False))
+            except Exception:
+                self._shinzen_analysis_inflight = False
+
+    def _animate_shinzen_bubble(self, show=True):
+        try:
+            bubble = getattr(self, "shinzen_bubble_outer", None)
+            if bubble is None:
+                return
+
+            if self._bubble_anim_job is not None:
+                try:
+                    self.after_cancel(self._bubble_anim_job)
+                except Exception:
+                    pass
+                self._bubble_anim_job = None
+
+            steps = 6
+            delay = 24
+            start_y = 0.078 if show else 0.02
+            end_y = 0.02 if show else 0.078
+
+            if show:
+                self._bubble_visible = True
+                bubble.place(relx=0.02, rely=start_y, width=210, height=126)
+
+            def step(i):
+                t = float(i) / float(steps)
+                y = start_y + ((end_y - start_y) * t)
+                try:
+                    bubble.place(relx=0.02, rely=y, width=210, height=126)
+                except Exception:
+                    return
+
+                if i < steps:
+                    self._bubble_anim_job = self.after(delay, lambda: step(i + 1))
+                    return
+
+                self._bubble_anim_job = None
+                self._bubble_visible = bool(show)
+                if not show:
+                    try:
+                        bubble.place_forget()
+                    except Exception:
+                        pass
+
+            step(0)
+        except Exception:
+            pass
+
+    def _show_shinzen_bubble(self, text, duration=None):
+        try:
+            widget = getattr(self, "shinzen_bubble_text", None)
+            if widget is None:
+                return
+            widget.config(state="normal")
+            widget.delete("1.0", "end")
+            widget.insert("1.0", self._sanitize_text(str(text), limit=140, keep=70))
+            widget.config(state="disabled")
+
+            self._animate_shinzen_bubble(show=True)
+
+            if self._bubble_hide_job is not None:
+                try:
+                    self.after_cancel(self._bubble_hide_job)
+                except Exception:
+                    pass
+                self._bubble_hide_job = None
+
+            if duration and int(duration) > 0:
+                self._bubble_hide_job = self.after(int(duration), self._hide_shinzen_bubble)
+        except Exception:
+            pass
+
+    def _hide_shinzen_bubble(self):
+        try:
+            should_animate = True
+            bubble = getattr(self, "shinzen_bubble_outer", None)
+            if bubble is not None and (not self._bubble_visible):
+                try:
+                    if not bubble.winfo_ismapped():
+                        should_animate = False
+                except Exception:
+                    should_animate = False
+            if should_animate:
+                self._animate_shinzen_bubble(show=False)
+            if self._bubble_hide_job is not None:
+                try:
+                    self.after_cancel(self._bubble_hide_job)
+                except Exception:
+                    pass
+                self._bubble_hide_job = None
+        except Exception:
+            pass
+
+    def _set_shinzen_suggestion(self, text, mood="explain", duration=8000):
+        """Update the Shinzen speech bubble text widget with AI-generated short guidance."""
+        try:
+            self._show_shinzen_bubble(text, duration=duration)
+            if hasattr(self, "shinzen") and self.shinzen is not None:
+                if hasattr(self.shinzen, "trigger"):
+                    self.shinzen.trigger("suggestion", hold_ms=min(2600, int(duration)))
+                    if mood and mood != "suggestion":
+                        self.shinzen.trigger(mood, hold_ms=min(2400, int(duration)))
+                else:
+                    self.shinzen.set_state(mood or "idea")
+        except Exception:
+            pass
+
+    def _pause_shinzen(self):
+        """Pause scheduled Shinzen analysis (e.g. while Coding AI is responding)."""
+        try:
+            self._shinzen_paused = True
+            if hasattr(self, "_shinzen_job") and self._shinzen_job is not None:
+                try:
+                    self.after_cancel(self._shinzen_job)
+                except Exception:
+                    pass
+                self._shinzen_job = None
+        except Exception:
+            pass
+
+    def _resume_shinzen(self):
+        """Resume Shinzen analysis after Coding AI finishes."""
+        try:
+            self._shinzen_paused = False
+            self._schedule_shinzen_analysis(delay=500, force=True)
+        except Exception:
+            pass
 
     # -------------------- FILE OPS --------------------
     def _open_snippet(self, path=None, from_restore=False):
@@ -1404,6 +2540,7 @@ class Code9Claude(ctk.CTk):
             self._highlight_syntax()
             self._update_file_label()
             self._save_preferences()
+            self._schedule_shinzen_analysis(delay=120, force=True)
             if not from_restore:
                 self._set_status_temporary(f"Opened {os.path.basename(fn)}", duration=1800)
             return True
@@ -1432,6 +2569,7 @@ class Code9Claude(ctk.CTk):
             self.editor.edit_modified(False)
             self._update_file_label()
             self._save_preferences()
+            self._schedule_shinzen_analysis(delay=180, force=True)
             self._set_status_temporary(f"Saved {os.path.basename(fn)}", duration=1800)
             return True
         except Exception as e:
@@ -1498,6 +2636,13 @@ class Code9Claude(ctk.CTk):
                 self._mark_editor_dirty()
                 self._schedule_session_autosave()
                 self.after(120, self._highlight_syntax)
+                # Schedule Shinzen analysis for suggestions
+                try:
+                    if hasattr(self, "shinzen") and self.shinzen is not None and hasattr(self.shinzen, "trigger"):
+                        self.shinzen.trigger("typing", hold_ms=700)
+                    self._schedule_shinzen_analysis()
+                except Exception:
+                    pass
                 self.editor.edit_modified(False)
         except Exception:
             pass
@@ -1579,21 +2724,28 @@ class Code9Claude(ctk.CTk):
 
         prompt = (
             "You are editing Python code. "
-            "Double check that it works before giving the user it"
+            "Double check that it works before giving the user it.\n"
             "Return only the updated code in a fenced Python block.\n\n"
             f"Current code:\n```python\n{code}\n```\n\n"
             f"Instruction:\n{instr}\n"
         )
 
-        self.start_loader()
-        self.status_label.configure(text="AI Fill running...")
+        if self.model_ready:
+            self.start_loader()
+        self._set_presence_message("AI Fill is rewriting your code...", mood="thinking")
         threading.Thread(target=self._generate_and_insert, args=(prompt, sel), daemon=True).start()
 
     def _generate_and_insert(self, prompt, selection_ranges=None):
         try:
             resp = self._generate_text(prompt=prompt, max_tokens=self.coding_max_tokens, mode="coding")
-            blocks = self._extract_code_blocks(resp)
-            new_code = blocks[-1] if blocks else resp
+            normalized = self._normalize_coding_response(resp)
+            new_code = normalized.get("code") or ""
+            display_text = normalized.get("response_text") or resp
+
+            if not new_code:
+                self.after(0, lambda: self._append_assistant(self.coding_card["text"], display_text, label="Coding AI"))
+                self.after(0, lambda: self._set_status_temporary("AI Fill skipped: output was not valid Python.", duration=2400))
+                return
 
             def apply_changes():
                 if selection_ranges:
@@ -1604,7 +2756,7 @@ class Code9Claude(ctk.CTk):
                 self._highlight_syntax()
                 self._mark_editor_dirty()
                 self._schedule_session_autosave()
-                self._append_assistant(self.coding_card["text"], resp, label="Coding AI")
+                self._append_assistant(self.coding_card["text"], display_text, label="Coding AI")
                 if self.auto_run_coding:
                     code_to_run = self.editor.get("1.0", "end-1c")
                     threading.Thread(target=self._run_code, args=(code_to_run, False), daemon=True).start()
@@ -1643,15 +2795,62 @@ class Code9Claude(ctk.CTk):
             self._set_status_temporary(f"Wrapper failed: {e}", duration=2400)
 
     # -------------------- BUTTONS / EVENTS --------------------
+    def _on_snail_clicked(self):
+        lines = [
+            "I am cheering for your next prompt.",
+            "Need help? Tap Help and I can guide the controls.",
+            "You are doing great. Keep going.",
+            "Let us make this session smooth and fast.",
+            "I can watch while you run code too.",
+        ]
+        self._set_presence_message(random.choice(lines), mood="wink", duration=2200)
+
+    def _set_presence_message(self, msg, mood="idle", duration=None, show_bubble=True):
+        try:
+            safe_msg = self._sanitize_text(str(msg), limit=120, keep=60)
+            try:
+                if hasattr(self, "shinzen") and self.shinzen is not None:
+                    if hasattr(self.shinzen, "trigger") and mood not in {"idle", "loading", "running", "thinking"}:
+                        hold = min(int(duration or 1800), 2800)
+                        self.shinzen.trigger(mood, hold_ms=hold)
+                    else:
+                        self.shinzen.set_state(mood)
+            except Exception:
+                pass
+
+            # Bubble is the unified status indicator.
+            if not show_bubble:
+                pass
+            elif (mood or "").lower() == "idle":
+                if self._bubble_hide_job is None and self._bubble_visible:
+                    self._hide_shinzen_bubble()
+            else:
+                bubble_duration = duration if duration else 4200
+                self._show_shinzen_bubble(safe_msg, duration=bubble_duration)
+
+            if self._presence_reset_job is not None:
+                try:
+                    self.after_cancel(self._presence_reset_job)
+                except Exception:
+                    pass
+                self._presence_reset_job = None
+
+            if duration and int(duration) > 0:
+                self._presence_reset_job = self.after(int(duration), self._refresh_status)
+        except Exception:
+            pass
+
     def start_loader(self):
         try:
             # increment active task count
             self._active_tasks = getattr(self, "_active_tasks", 0) + 1
-            # show loader when first active task begins
             if self._active_tasks == 1:
-                self.loader_frame.pack(side="right", padx=(0, 8))
-                self.loader.pack()
-                self.loader.start()
+                # Prefer shinzen animation if available
+                if hasattr(self, "shinzen") and self.shinzen is not None:
+                    self.shinzen.start()
+                elif hasattr(self, "loader") and self.loader is not None:
+                    self.loader.start()
+                self._set_presence_message("Thinking through this with care...", mood="thinking")
         except Exception:
             pass
 
@@ -1661,9 +2860,12 @@ class Code9Claude(ctk.CTk):
             "save_as_button",
             "run_button",
             "ai_fill_btn",
+            "undo_ai_btn",
+            "runtime_btn",
             "shell_btn",
             "ideas_btn",
             "settings_btn",
+            "help_btn",
             "clear_chat_btn",
         ]
         for btn_name in disable_buttons:
@@ -1674,7 +2876,7 @@ class Code9Claude(ctk.CTk):
             except Exception:
                 pass
 
-        for widget in [self.general_card["entry"], self.general_card["ask"], self.coding_card["entry"], self.coding_card["ask"]]:
+        for widget in [self.coding_card["entry"], self.coding_card["ask"]]:
             try:
                 widget.configure(state="disabled")
             except Exception:
@@ -1685,8 +2887,10 @@ class Code9Claude(ctk.CTk):
             # decrement active tasks
             self._active_tasks = max(0, getattr(self, "_active_tasks", 0) - 1)
             if self._active_tasks == 0:
-                self.loader.stop()
-                self.loader_frame.pack_forget()
+                if hasattr(self, "shinzen") and self.shinzen is not None:
+                    self.shinzen.stop()
+                elif hasattr(self, "loader") and self.loader is not None:
+                    self.loader.stop()
         except Exception:
             pass
 
@@ -1696,9 +2900,12 @@ class Code9Claude(ctk.CTk):
             "save_as_button",
             "run_button",
             "ai_fill_btn",
+            "undo_ai_btn",
+            "runtime_btn",
             "shell_btn",
             "ideas_btn",
             "settings_btn",
+            "help_btn",
             "clear_chat_btn",
         ]
         for btn_name in enable_buttons:
@@ -1709,13 +2916,12 @@ class Code9Claude(ctk.CTk):
             except Exception:
                 pass
 
-        for widget in [self.general_card["entry"], self.general_card["ask"], self.coding_card["entry"], self.coding_card["ask"]]:
+        for widget in [self.coding_card["entry"], self.coding_card["ask"]]:
             try:
                 widget.configure(state="normal")
             except Exception:
                 pass
 
-        # Refresh status: if no active tasks and no running process, show Idle
         try:
             self._refresh_status()
         except Exception:
@@ -1723,45 +2929,45 @@ class Code9Claude(ctk.CTk):
 
     def _set_status_temporary(self, msg, duration=3000):
         try:
-            prev = self.status_label.cget("text")
-            self.status_label.configure(text=msg)
-            # after the duration, refresh status (so Idle can be restored rather than previous transient msg)
-            self.after(duration, lambda: self._refresh_status())
+            lowered = str(msg).lower()
+            mood = "idle"
+            if any(x in lowered for x in ("error", "failed", "timeout", "killed")):
+                mood = "alert"
+            elif any(x in lowered for x in ("stopped", "cancelled", "skipped", "blocked")):
+                mood = "concern"
+            elif any(x in lowered for x in ("running", "executing")):
+                mood = "running"
+            elif any(x in lowered for x in ("attached", "detached", "copied")):
+                mood = "listening"
+            elif any(x in lowered for x in ("saved", "opened", "created", "copied", "enabled", "shared", "injected")):
+                mood = "celebrate"
+            self._set_presence_message(msg, mood=mood, duration=duration)
         except Exception:
             pass
 
     def _refresh_status(self):
-        """Set a sensible status label based on model/load/run state.
-
-        Rules:
-        - If the model is loading and not failed, show model loading text.
-        - If model failed or not installed, show those messages.
-        - If there's a running engine process, show Running engine code...
-        - If there are active tasks (loader), keep existing message.
-        - Otherwise show Idle.
-        """
+        """Keep Shinzen's message in sync with model/run/task state."""
         try:
-            # model not installed
             if not MLX_AVAILABLE:
-                self.status_label.configure(text="Model: not installed")
+                self._set_presence_message("Model runtime not installed. Engine tools are still ready.", mood="concern")
                 return
-            # model is loading
             if not self.model_ready and not self.model_failed:
-                self.status_label.configure(text=f"Model: loading ({DEVICE})")
+                self._set_presence_message(f"Loading model on {DEVICE}...", mood="thinking")
                 return
             if self.model_failed:
-                self.status_label.configure(text="Model: failed")
+                self._set_presence_message("Model load failed. You can still run code and retry.", mood="concern")
                 return
-            # if a process is running
             proc = getattr(self, "current_proc", None)
             if proc is not None and proc.poll() is None:
-                self.status_label.configure(text="Running engine code...")
+                self._set_presence_message("Running your engine code now...", mood="running")
                 return
-            # if there are active tasks, don't force Idle (leave current text)
             if getattr(self, "_active_tasks", 0) > 0:
+                self._set_presence_message("I am working on your request...", mood="thinking")
                 return
-            # otherwise Idle (show model readiness as well)
-            self.status_label.configure(text=f"Idle — Model: ready ({DEVICE})")
+            if self._shinzen_is_idle():
+                self._set_presence_message(f"Ready on {DEVICE}. I can suggest the next tweak when you are ready.", mood="sleepy")
+            else:
+                self._set_presence_message(f"Ready on {DEVICE}. Ask anything when you are.", mood="idle")
         except Exception:
             pass
 
@@ -1781,26 +2987,27 @@ class Code9Claude(ctk.CTk):
             pass
 
     def _stop_response(self, kind=None):
-        """Cancel an in-progress AI response for the given kind (general/coding) by bumping its token."""
+        """Cancel an in-progress AI response for the given kind (coding) by bumping its token."""
         try:
-            if kind in ("general", "coding"):
+            if kind == "coding":
                 self.abort_tokens[kind] = self.abort_tokens.get(kind, 0) + 1
                 self._set_status_temporary(f"Stopped {kind} response", duration=900)
+                self.stop_loader()
             else:
-                # Cancel both
+                # Cancel coding
                 for k in list(self.abort_tokens.keys()):
                     self.abort_tokens[k] = self.abort_tokens.get(k, 0) + 1
                 self._set_status_temporary("Stopped responses", duration=900)
+                self.stop_loader()
         except Exception:
             pass
 
     def _show_coding_slash_menu(self, x, y):
         menu = tk.Menu(self, tearoff=0)
-        # Insert tag into entry instead of immediate attach
         menu.add_command(label="/Runtime", command=lambda: self._insert_attachment_tag_into_entry("Runtime"))
         menu.add_command(label="/Engine", command=lambda: self._insert_attachment_tag_into_entry("Engine"))
         menu.add_command(label="/Errors", command=lambda: self._insert_attachment_tag_into_entry("Errors"))
-        menu.add_command(label="/General", command=lambda: self._insert_attachment_tag_into_entry("General"))
+        menu.add_command(label="/Shinzen", command=lambda: self._insert_attachment_tag_into_entry("Shinzen"))
         try:
             menu.post(x, y)
         except Exception:
@@ -1971,12 +3178,17 @@ class Code9Claude(ctk.CTk):
 
     def _attach_runtime_output_to_coding(self):
         try:
+            if getattr(self, "output_text", None) is None:
+                self._set_status_temporary("Runtime window has no output yet", duration=1400)
+                return
             out = self.output_text.get("1.0", "end-1c").strip()
             if not out:
                 self._set_status_temporary("No runtime output available", duration=1400)
                 return
-            snippet = out[-1200:]
-            payload = f"--- Runtime output (truncated) ---\n{snippet}\n--- end ---"
+            payload = AttachmentManager.prepare_runtime_snippet(out, max_chars=1200)
+            if not payload:
+                self._set_status_temporary("No runtime output available", duration=1400)
+                return
             # toggle attachment
             self._add_coding_attachment("Runtime output", "Runtime output", payload)
         except Exception:
@@ -1988,34 +3200,88 @@ class Code9Claude(ctk.CTk):
             if not code:
                 self._set_status_temporary("Engine textbox is empty", duration=1400)
                 return
-            snippet = code[:1600]
-            payload = f"--- Engine code (truncated) ---\n```python\n{snippet}\n```\n--- end ---"
+            payload = AttachmentManager.prepare_engine_snippet(code, max_chars=1600)
+            if not payload:
+                self._set_status_temporary("Engine textbox is empty", duration=1400)
+                return
             self._add_coding_attachment("Engine code", "Engine code", payload)
         except Exception:
             pass
 
     def _attach_errors_to_coding(self):
         try:
+            if getattr(self, "output_text", None) is None:
+                self._set_status_temporary("Runtime window has no output yet", duration=1400)
+                return
             out = self.output_text.get("1.0", "end-1c")
-            lines = [l for l in out.splitlines() if l.strip().startswith("ERR:") or "Traceback" in l or "Exception" in l]
-            if not lines:
+            payload = AttachmentManager.prepare_error_snippet(out, max_lines=80)
+            if not payload:
                 self._set_status_temporary("No error lines found in runtime output", duration=1400)
                 return
-            snippet = "\n".join(lines[-80:])
-            payload = f"--- Errors (truncated) ---\n{snippet}\n--- end ---"
             self._add_coding_attachment("Errors", "Errors", payload)
         except Exception:
             pass
 
     def _attach_general_chat_to_coding(self):
         try:
-            text = self.general_card["text"].get("1.0", "end-1c").strip()
-            if not text:
-                self._set_status_temporary("General AI chat is empty", duration=1400)
+            self._set_status_temporary("General AI chat not available", duration=1400)
+        except Exception:
+            pass
+
+    def _attach_shinzen_to_coding(self):
+        try:
+            txt = (getattr(self, "_last_shinzen_comment", "") or "").strip()
+            if not txt:
+                target = getattr(self, 'shinzen_bubble_text', None) or getattr(self, 'shinzen_suggestions', None)
+                if target is not None:
+                    txt = target.get('1.0', 'end-1c').strip()
+            if not txt:
+                self._set_status_temporary('No Shinzen suggestions to attach', duration=1400)
                 return
-            snippet = text[-1200:]
-            payload = f"--- General AI chat (truncated) ---\n{snippet}\n--- end ---"
-            self._add_coding_attachment("General chat", "General chat", payload)
+            payload = AttachmentManager.prepare_shinzen_snippet(txt, max_chars=320)
+            if not payload:
+                self._set_status_temporary('No Shinzen suggestions to attach', duration=1400)
+                return
+            self._add_coding_attachment('Shinzen', 'Shinzen suggestions', payload)
+            self._set_status_temporary('Shinzen suggestions attached to Coding AI', duration=1400)
+        except Exception:
+            pass
+
+    def _insert_shinzen_into_engine(self):
+        try:
+            txt = (getattr(self, "_last_shinzen_comment", "") or "").strip()
+            if not txt:
+                target = getattr(self, 'shinzen_bubble_text', None) or getattr(self, 'shinzen_suggestions', None)
+                if target is not None:
+                    txt = target.get('1.0', 'end-1c').strip()
+            if not txt:
+                self._set_status_temporary('No Shinzen suggestions to insert', duration=1400)
+                return
+            commented = '# Shinzen suggestions:\n' + '\n'.join('# ' + ln for ln in txt.splitlines()) + '\n\n'
+            current = self.editor.get('1.0', 'end-1c')
+            if current.strip():
+                self.editor.insert('end', '\n' + commented)
+            else:
+                self.editor.insert('1.0', commented)
+            self._highlight_syntax()
+            self._mark_editor_dirty()
+            self._schedule_session_autosave()
+            self._set_status_temporary('Inserted Shinzen suggestions into Engine', duration=1400)
+        except Exception:
+            pass
+
+    def _undo_last_ai_injection(self):
+        try:
+            if self._last_ai_injection is None:
+                self._set_status_temporary("No AI injection snapshot to undo", duration=1400)
+                return
+            self.editor.delete("1.0", "end")
+            self.editor.insert("1.0", self._last_ai_injection)
+            self._highlight_syntax()
+            self._mark_editor_dirty()
+            self._schedule_session_autosave()
+            self._set_status_temporary("Reverted last AI code injection", duration=1800)
+            self._last_ai_injection = None
         except Exception:
             pass
 
@@ -2030,12 +3296,15 @@ class Code9Claude(ctk.CTk):
 
     def _on_run_clicked(self):
         self._set_status_temporary("Running engine code...")
-        self.start_loader()
+        self._open_runtime_terminal()
+        if self.model_ready:
+            self.start_loader()
         code = self.editor.get("1.0", "end-1c")
         threading.Thread(target=self._run_code, args=(code, True), daemon=True).start()
 
     def _on_stop_clicked(self):
         self._set_status_temporary("Stopping process...", duration=1800)
+        self._stop_response("coding")
         self._kill_current_proc()
         self.stop_loader()
 
@@ -2046,9 +3315,8 @@ class Code9Claude(ctk.CTk):
         self._create_shell()
 
     def _on_clear_clicked(self):
-        self._clear_chat_widget(self.general_card["text"])
         self._clear_chat_widget(self.coding_card["text"])
-        self._set_status_temporary("Both chats cleared", duration=1500)
+        self._set_status_temporary("Chat cleared", duration=1500)
 
     def _toggle_auto_run(self):
         self.auto_run_coding = not self.auto_run_coding
@@ -2078,8 +3346,8 @@ class Code9Claude(ctk.CTk):
     def _share_project_ideas(self):
         ideas = random.sample(self.project_ideas, k=min(6, len(self.project_ideas)))
         body = "Here are some project upgrade ideas:\n\n" + "\n".join([f"{i + 1}. {idea}" for i, idea in enumerate(ideas)])
-        self._append_assistant(self.general_card["text"], body, label="Idea Coach")
-        self._set_status_temporary("Shared new project ideas in General AI", duration=1800)
+        self._append_assistant(self.coding_card["text"], body, label="Idea Coach")
+        self._set_presence_message("Shared new project ideas", mood="idea", duration=2400)
 
     def _coerce_int(self, value, min_v, max_v, fallback):
         try:
@@ -2089,7 +3357,6 @@ class Code9Claude(ctk.CTk):
             return fallback
 
     def _bind_shortcuts(self):
-        self.general_card["entry"].bind("<Return>", self.ask_general_ai)
         self.coding_card["entry"].bind("<Return>", self.ask_coding_ai)
         # detect '/' trigger in coding entry to open attach menu
         try:
@@ -2101,6 +3368,38 @@ class Code9Claude(ctk.CTk):
         self.bind_all("<Command-s>", self._shortcut_save)
         self.bind_all("<Control-o>", self._shortcut_open)
         self.bind_all("<Command-o>", self._shortcut_open)
+        self.bind_all("<F1>", lambda _e: self._open_help())
+
+    # -------------------- Layout helpers --------------------
+    def _on_root_configure(self, event=None):
+        # Debounce rapid resize events
+        try:
+            if getattr(self, "_right_resize_job", None):
+                try:
+                    self.after_cancel(self._right_resize_job)
+                except Exception:
+                    pass
+            self._right_resize_job = self.after(120, self._enforce_right_panel_height)
+        except Exception:
+            pass
+
+    def _enforce_right_panel_height(self):
+        try:
+            total_h = self.winfo_height()
+            if not total_h or total_h <= 0:
+                return
+            max_allowed = int(total_h * getattr(self, "_right_max_frac", 1.0 / 3.0))
+            # allow some minimal height
+            try:
+                min_h = 180
+                override = getattr(self, '_right_min_height_required', 0) or 0
+                # choose the largest of min, max_allowed, and any explicit required minimum (e.g., when coding card is placed lower)
+                desired = max(min_h, max_allowed, override)
+                self.right.configure(height=desired)
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def _shortcut_save(self, event=None):
         self._on_save_clicked()
@@ -2112,5 +3411,5 @@ class Code9Claude(ctk.CTk):
 
 
 if __name__ == "__main__":
-    app = Code9Claude()
+    app = Code9()
     app.mainloop()
