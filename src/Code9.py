@@ -1729,53 +1729,53 @@ class Code9(ctk.CTk):
         threading.Thread(target=self._coding_worker, args=(query, req_id, intent), daemon=True).start()
 
     def _coding_worker(self, query, reqid=None, intent="code"):
-    try:
-        self.after0(self.lockui)
-        editor = getattr(self, "editor", None)
-        if editor is None:
-            return
-
         try:
-            editorsnapshot = editor.get("1.0", "end-1c")
-        except Exception:
-            editorsnapshot = ""
-
-        attachmentstext = ""
-        try:
-            attachments = getattr(self, "codingattachments", {}) or {}
-            if attachments:
-                attachmentstext = "Attached resources:\n" + "\n\n".join(
-                    str(v) for v in attachments.values() if v
-                )
-        except Exception:
+            self.after0(self.lockui)
+            editor = getattr(self, "editor", None)
+            if editor is None:
+                return
+    
+            try:
+                editorsnapshot = editor.get("1.0", "end-1c")
+            except Exception:
+                editorsnapshot = ""
+    
             attachmentstext = ""
-
-        prompt = self.buildcodingprompt(query, editorsnapshot, attachmentstext, intent)
-        response = self.generatetext(prompt, self.codingmaxtokens, mode=intent)
-
-        if reqid is not None and reqid != getattr(self, "aborttokens", {}).get("coding", reqid):
-            return
-
-        if not response:
-            return
-
-        normalized = self.normalizecodingresponses(response)
-        if normalized.get("needsretry"):
-            repair_prompt = self.buildcodingrepairprompt(query, response, normalized.get("issue"))
-            repaired = self.generatetext(repair_prompt, self.codingmaxtokens, mode="coding")
-            normalized = self.normalizecodingresponses(repaired)
-
-        if normalized.get("code"):
-            self.after0(self.injectcodeintoengine, normalized["code"])
-        else:
-            self.after0(self.appendassistant, self.codingcardtext, response, label="Code AI")
-    except Exception:
-        self.after0(self.appendoutput, traceback.format_exc())
-    finally:
-        try:
-            self.after0(self.refreshstatus)
+            try:
+                attachments = getattr(self, "codingattachments", {}) or {}
+                if attachments:
+                    attachmentstext = "Attached resources:\n" + "\n\n".join(
+                        str(v) for v in attachments.values() if v
+                    )
+            except Exception:
+                attachmentstext = ""
+    
+            prompt = self.buildcodingprompt(query, editorsnapshot, attachmentstext, intent)
+            response = self.generatetext(prompt, self.codingmaxtokens, mode=intent)
+    
+            if reqid is not None and reqid != getattr(self, "aborttokens", {}).get("coding", reqid):
+                return
+    
+            if not response:
+                return
+    
+            normalized = self.normalizecodingresponses(response)
+            if normalized.get("needsretry"):
+                repair_prompt = self.buildcodingrepairprompt(query, response, normalized.get("issue"))
+                repaired = self.generatetext(repair_prompt, self.codingmaxtokens, mode="coding")
+                normalized = self.normalizecodingresponses(repaired)
+    
+            if normalized.get("code"):
+                self.after0(self.injectcodeintoengine, normalized["code"])
+            else:
+                self.after0(self.appendassistant, self.codingcardtext, response, label="Code AI")
         except Exception:
-            pass
+            self.after0(self.appendoutput, traceback.format_exc())
+        finally:
+            try:
+                self.after0(self.refreshstatus)
+            except Exception:
+                pass
 
     def _extract_code_blocks(self, text):
         try:
