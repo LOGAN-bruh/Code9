@@ -4,6 +4,7 @@ from tkinter import filedialog, simpledialog
 import subprocess
 import tempfile
 import os
+import shutil
 import threading
 import sys
 import traceback
@@ -15,10 +16,12 @@ import json
 import random
 import inspect
 import ast
+import importlib.util
 from Shinzen import Shinzen
 from chat_sanitizer import ChatSanitizer
 from attachment_manager import AttachmentManager
 from model_wrapper import ModelWrapper
+from config import Config
 
 currentTime = datetime.now()
 
@@ -218,26 +221,30 @@ class Code9(ctk.CTk):
         self.settings_path = os.path.join(self.config_dir, "settings.json")
         self.session_path = os.path.join(self.config_dir, "session_draft.py")
         os.makedirs(self.config_dir, exist_ok=True)
+        self.config = Config(self.settings_path)
 
         # Defaults (overridden by settings)
         self.username = os.getenv("USER") or os.getenv("USERNAME") or "Coder"
         self.auto_run_coding = True
-        self.insert_mode = "replace"          # replace | append
-        self.run_mode = "temp"                # temp | active_file
+        self.insert_mode = "replace"          # replace | append | noop
+        self.run_mode = "workspace"                # temp | active_file | workspace
         self.enable_typewriter = True
         self.coding_max_tokens = 900
         self.run_timeout_sec = 60
         self.persist_session = True
         self.restore_last_file = False
         self.last_opened_file = ""
+        self.auto_install_missing_imports = False
+        self.python_exec_path = sys.executable
+        self.project_root = os.getcwd()
         # Link Shinzen suggestions automatically into the Coding AI prompts
         self.include_shinzen_in_coding = True
         self.stop_on_bad_response = True
         self.require_code_block_for_injection = True
-        self.preferred_coding_model = ""
-        self.preferred_shinzen_model = ""
-        self.loaded_coding_model_name = ""
-        self.loaded_shinzen_model_name = ""
+        self.preferred_coding_model = "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit"
+        self.preferred_shinzen_model = "mlx-community/Phi-3.5-mini-instruct-4bit"
+        self.loaded_coding_model_name = "Qwen2.5-Coder-7B-Instruct-4bit"
+        self.loaded_shinzen_model_name = "Phi-3.5-mini-instruct-4bit"
         self._last_ai_injection = None
         self.shinzen_feedback_cooldown_sec = 20
         self.shinzen_refresh_timer_sec = 30
@@ -383,6 +390,9 @@ class Code9(ctk.CTk):
         self.open_button = self._make_toolbar_button(self.btn_bar, "Open", 70, self._on_open_clicked)
         self.open_button.pack(side="left", padx=4)
 
+        self.open_project_button = self._make_toolbar_button(self.btn_bar, "Project", 84, self._on_open_project_clicked)
+        self.open_project_button.pack(side="left", padx=4)
+
         self.save_button = self._make_toolbar_button(self.btn_bar, "Save", 70, self._on_save_clicked)
         self.save_button.pack(side="left", padx=4)
 
@@ -414,7 +424,7 @@ class Code9(ctk.CTk):
         self.shell_btn = self._make_toolbar_button(self.btn_bar, "Shell", 72, self._on_create_shell_clicked)
         self.shell_btn.pack(side="left", padx=4)
 
-        self.ideas_btn = self._make_toolbar_button(self.btn_bar, "Ideas", 72, self._share_project_ideas)
+        self.ideas_btn = self._make_toolbar_button(self.btn_bar, "Ideas", 70, self.request_shinzen_ideas)
         self.ideas_btn.pack(side="left", padx=4)
 
         self.settings_btn = self._make_toolbar_button(self.btn_bar, "Settings", 86, self._open_settings)
@@ -616,7 +626,7 @@ class Code9(ctk.CTk):
 
             self.insert_mode_btn = ctk.CTkButton(
                 header,
-                text="Insert: Replace" if self.insert_mode == "replace" else "Insert: Append",
+                text=self._insert_mode_button_text(),
                 width=112,
                 corner_radius=14,
                 fg_color=SURFACE_ALT,
@@ -726,21 +736,21 @@ class Code9(ctk.CTk):
     # -------------------- SETTINGS & PERSISTENCE --------------------
     def _load_preferences(self):
         try:
-            if not os.path.exists(self.settings_path):
-                return
-            with open(self.settings_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-
+            self.config.load()
+            data = dict(getattr(self.config, "data", {}) or {})
             self.username = data.get("username", self.username)
             self.auto_run_coding = bool(data.get("auto_run_coding", self.auto_run_coding))
-            self.insert_mode = data.get("insert_mode", self.insert_mode) if data.get("insert_mode") in {"replace", "append"} else self.insert_mode
-            self.run_mode = data.get("run_mode", self.run_mode) if data.get("run_mode") in {"temp", "active_file"} else self.run_mode
+            self.insert_mode = data.get("insert_mode", self.insert_mode) if data.get("insert_mode") in {"replace", "append", "noop"} else self.insert_mode
+            self.run_mode = data.get("run_mode", self.run_mode) if data.get("run_mode") in {"temp", "active_file", "workspace"} else self.run_mode
             self.enable_typewriter = bool(data.get("enable_typewriter", self.enable_typewriter))
             self.coding_max_tokens = self._coerce_int(data.get("coding_max_tokens", self.coding_max_tokens), 120, 4000, self.coding_max_tokens)
             self.run_timeout_sec = self._coerce_int(data.get("run_timeout_sec", self.run_timeout_sec), 5, 600, self.run_timeout_sec)
             self.persist_session = bool(data.get("persist_session", self.persist_session))
             self.restore_last_file = bool(data.get("restore_last_file", self.restore_last_file))
             self.last_opened_file = data.get("last_opened_file", "")
+            self.auto_install_missing_imports = bool(data.get("auto_install_missing_imports", self.auto_install_missing_imports))
+            self.python_exec_path = (data.get("python_exec_path", self.python_exec_path) or self.python_exec_path).strip()
+            self.project_root = (data.get("project_root", self.project_root) or self.project_root).strip() or self.project_root
             self.include_shinzen_in_coding = bool(data.get("include_shinzen_in_coding", self.include_shinzen_in_coding))
             self.stop_on_bad_response = bool(data.get("stop_on_bad_response", self.stop_on_bad_response))
             self.require_code_block_for_injection = bool(data.get("require_code_block_for_injection", self.require_code_block_for_injection))
@@ -754,7 +764,7 @@ class Code9(ctk.CTk):
             pass
 
     def _save_preferences(self):
-        data = {
+        payload = {
             "username": self.username,
             "auto_run_coding": self.auto_run_coding,
             "insert_mode": self.insert_mode,
@@ -765,6 +775,9 @@ class Code9(ctk.CTk):
             "persist_session": self.persist_session,
             "restore_last_file": self.restore_last_file,
             "last_opened_file": self.current_file_path or self.last_opened_file,
+            "auto_install_missing_imports": self.auto_install_missing_imports,
+            "python_exec_path": self.python_exec_path,
+            "project_root": self.project_root,
             "include_shinzen_in_coding": self.include_shinzen_in_coding,
             "stop_on_bad_response": self.stop_on_bad_response,
             "require_code_block_for_injection": self.require_code_block_for_injection,
@@ -776,8 +789,8 @@ class Code9(ctk.CTk):
             "shinzen_idle_interval_sec": self.shinzen_idle_interval_sec,
         }
         try:
-            with open(self.settings_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
+            self.config.data = payload
+            self.config.save()
         except Exception:
             pass
 
@@ -860,6 +873,7 @@ class Code9(ctk.CTk):
         stop_bad_var = tk.BooleanVar(value=self.stop_on_bad_response)
         require_block_var = tk.BooleanVar(value=self.require_code_block_for_injection)
         idle_ideas_var = tk.BooleanVar(value=self.shinzen_idle_suggestions_enabled)
+        auto_install_var = tk.BooleanVar(value=self.auto_install_missing_imports)
 
         ctk.CTkCheckBox(wrap, text="Auto-run code from Coding AI", variable=auto_run_var, text_color=TEXT).pack(anchor="w", pady=4)
         ctk.CTkCheckBox(wrap, text="Typewriter animation in chat", variable=type_var, text_color=TEXT).pack(anchor="w", pady=4)
@@ -868,48 +882,28 @@ class Code9(ctk.CTk):
         ctk.CTkCheckBox(wrap, text="Auto-stop nonsense coding replies", variable=stop_bad_var, text_color=TEXT).pack(anchor="w", pady=4)
         ctk.CTkCheckBox(wrap, text="Require fenced code block before injection", variable=require_block_var, text_color=TEXT).pack(anchor="w", pady=4)
         ctk.CTkCheckBox(wrap, text="Enable idle code ideas", variable=idle_ideas_var, text_color=TEXT).pack(anchor="w", pady=4)
+        ctk.CTkCheckBox(wrap, text="Auto-install missing imports before run (e.g., pygame)", variable=auto_install_var, text_color=TEXT).pack(anchor="w", pady=4)
 
         ctk.CTkLabel(wrap, text="Run Mode", text_color=TEXT, font=(BASE_FONT[0], 13, "bold")).pack(anchor="w", pady=(14, 4))
         run_mode_map = {
             "Temp Sandbox (isolated)": "temp",
             "Active File (save + run)": "active_file",
+            "Workspace Sandbox (multi-file + assets)": "workspace",
         }
-        run_mode_var = tk.StringVar(value="Temp Sandbox (isolated)" if self.run_mode == "temp" else "Active File (save + run)")
+        run_mode_label = next((k for k, v in run_mode_map.items() if v == self.run_mode), "Temp Sandbox (isolated)")
+        run_mode_var = tk.StringVar(value=run_mode_label)
         ctk.CTkOptionMenu(wrap, values=list(run_mode_map.keys()), variable=run_mode_var, fg_color=SURFACE_ALT, button_color=SOFT, button_hover_color=ACCENT_HOVER, text_color=TEXT).pack(anchor="w", pady=2)
 
         ctk.CTkLabel(wrap, text="Code Insert Mode", text_color=TEXT, font=(BASE_FONT[0], 13, "bold")).pack(anchor="w", pady=(12, 4))
         insert_map = {
             "Replace Engine Content": "replace",
             "Append to Engine Content": "append",
+            "Do Not Inject (preview only)": "noop",
         }
-        insert_var = tk.StringVar(value="Replace Engine Content" if self.insert_mode == "replace" else "Append to Engine Content")
+        insert_label = next((k for k, v in insert_map.items() if v == self.insert_mode), "Replace Engine Content")
+        insert_var = tk.StringVar(value=insert_label)
         ctk.CTkOptionMenu(wrap, values=list(insert_map.keys()), variable=insert_var, fg_color=SURFACE_ALT, button_color=SOFT, button_hover_color=ACCENT_HOVER, text_color=TEXT).pack(anchor="w", pady=2)
 
-        ctk.CTkLabel(wrap, text="Coding Model", text_color=TEXT, font=(BASE_FONT[0], 13, "bold")).pack(anchor="w", pady=(12, 4))
-        coding_model_values = ["(Auto)"] + CODING_MODEL_CANDIDATES
-        coding_model_var = tk.StringVar(value=self.preferred_coding_model if self.preferred_coding_model else "(Auto)")
-        ctk.CTkOptionMenu(
-            wrap,
-            values=coding_model_values,
-            variable=coding_model_var,
-            fg_color=SURFACE_ALT,
-            button_color=SOFT,
-            button_hover_color=ACCENT_HOVER,
-            text_color=TEXT,
-        ).pack(anchor="w", pady=2)
-
-        ctk.CTkLabel(wrap, text="Shinzen Comment Model", text_color=TEXT, font=(BASE_FONT[0], 13, "bold")).pack(anchor="w", pady=(12, 4))
-        shinzen_model_values = ["(Auto)"] + SHINZEN_MODEL_CANDIDATES
-        shinzen_model_var = tk.StringVar(value=self.preferred_shinzen_model if self.preferred_shinzen_model else "(Auto)")
-        ctk.CTkOptionMenu(
-            wrap,
-            values=shinzen_model_values,
-            variable=shinzen_model_var,
-            fg_color=SURFACE_ALT,
-            button_color=SOFT,
-            button_hover_color=ACCENT_HOVER,
-            text_color=TEXT,
-        ).pack(anchor="w", pady=2)
 
         grid = ctk.CTkFrame(wrap, fg_color=SURFACE, corner_radius=12)
         grid.pack(fill="x", pady=(14, 2))
@@ -945,6 +939,16 @@ class Code9(ctk.CTk):
         shinzen_idle_entry.grid(row=5, column=1, sticky="ew", padx=(10, 0), pady=6)
         shinzen_idle_entry.insert(0, str(self.shinzen_idle_interval_sec))
 
+        ctk.CTkLabel(grid, text="Run Python interpreter", text_color=MUTED).grid(row=6, column=0, sticky="w", pady=6)
+        py_exec_entry = ctk.CTkEntry(grid, fg_color=SURFACE_ALT)
+        py_exec_entry.grid(row=6, column=1, sticky="ew", padx=(10, 0), pady=6)
+        py_exec_entry.insert(0, str(self.python_exec_path))
+
+        ctk.CTkLabel(grid, text="Project root (optional)", text_color=MUTED).grid(row=7, column=0, sticky="w", pady=6)
+        project_root_entry = ctk.CTkEntry(grid, fg_color=SURFACE_ALT)
+        project_root_entry.grid(row=7, column=1, sticky="ew", padx=(10, 0), pady=6)
+        project_root_entry.insert(0, str(self.project_root))
+
         btns = ctk.CTkFrame(wrap, fg_color=SURFACE, corner_radius=12)
         btns.pack(fill="x", pady=(16, 2))
         btns.grid_columnconfigure(0, weight=1)
@@ -960,18 +964,19 @@ class Code9(ctk.CTk):
             self.stop_on_bad_response = bool(stop_bad_var.get())
             self.require_code_block_for_injection = bool(require_block_var.get())
             self.shinzen_idle_suggestions_enabled = bool(idle_ideas_var.get())
+            self.auto_install_missing_imports = bool(auto_install_var.get())
 
             self.run_mode = run_mode_map.get(run_mode_var.get(), self.run_mode)
             self.insert_mode = insert_map.get(insert_var.get(), self.insert_mode)
-            self.preferred_coding_model = "" if coding_model_var.get() == "(Auto)" else coding_model_var.get()
-            self.preferred_shinzen_model = "" if shinzen_model_var.get() == "(Auto)" else shinzen_model_var.get()
-
             self.coding_max_tokens = self._coerce_int(coding_entry.get(), 120, 4000, self.coding_max_tokens)
             self.username = username_entry.get().strip() or "Coder"
             self.run_timeout_sec = self._coerce_int(timeout_entry.get(), 5, 600, self.run_timeout_sec)
             self.shinzen_feedback_cooldown_sec = self._coerce_int(shinzen_cooldown_entry.get(), 5, 300, self.shinzen_feedback_cooldown_sec)
             self.shinzen_refresh_timer_sec = self._coerce_int(shinzen_refresh_entry.get(), 10, 300, self.shinzen_refresh_timer_sec)
             self.shinzen_idle_interval_sec = self._coerce_int(shinzen_idle_entry.get(), 20, 600, self.shinzen_idle_interval_sec)
+            py_exec = py_exec_entry.get().strip()
+            self.python_exec_path = py_exec if py_exec else sys.executable
+            self.project_root = project_root_entry.get().strip() or self.project_root
             self._schedule_shinzen_analysis(delay=200, force=True)
 
             self._refresh_coding_controls()
@@ -1048,8 +1053,9 @@ class Code9(ctk.CTk):
             "- Engine injection guard: malformed Python from AI is blocked before editor updates.\n\n"
             "Top Buttons\n"
             "- Open: open a local file into the Engine editor.\n"
+            "- Project: choose a project root folder for workspace sandbox runs.\n"
             "- Save / Save As: save current Engine content.\n"
-            "- Run: execute Engine code in temp sandbox or active file mode.\n"
+            "- Run: execute Engine code in temp sandbox, active file mode, or workspace sandbox mode.\n"
             "- Stop: stop the running Engine process.\n"
             "- AI Fill: rewrite selected code (or full editor) from a natural-language instruction.\n"
             "- Shell: export a launcher script for the current Engine code.\n"
@@ -1065,12 +1071,15 @@ class Code9(ctk.CTk):
             "- Auto-stop nonsense coding replies: cancels repetitive/low-quality coding output.\n"
             "- Require fenced code block before injection: safer code insertion from coding replies.\n"
             "- Enable idle code ideas: Shinzen gives project ideas while you are idle.\n"
-            "- Run Mode: Temp Sandbox isolates runs; Active File runs the saved file directly.\n"
-            "- Code Insert Mode: Replace swaps whole editor; Append adds generated code at end.\n"
+            "- Auto-install missing imports: installs unresolved packages (like pygame) before run.\n"
+            "- Run Mode: Temp Sandbox isolates runs; Active File runs the saved file directly; Workspace Sandbox copies your project for multi-file/assets runs.\n"
+            "- Code Insert Mode: Replace swaps whole editor; Append adds generated code at end; Preview mode leaves editor unchanged.\n"
             "- Coding Model: primary model for coding chat and AI Fill.\n"
             "- Shinzen Comment Model: lightweight model for Shinzen bubble feedback.\n"
             "- Coding max tokens: max length for coding responses.\n"
             "- Run timeout (sec): maximum runtime before process is stopped.\n"
+            "- Run Python interpreter: choose the Python executable used by Run.\n"
+            "- Project root: base folder used by workspace sandbox runs.\n"
             "- Shinzen cooldown (sec): minimum time between Shinzen comments.\n"
             "- Shinzen refresh timer (sec): periodic refresh cadence while actively coding.\n"
             "- Idle suggestion interval (sec): idea cadence while idle.\n\n"
@@ -1078,15 +1087,9 @@ class Code9(ctk.CTk):
             "- Safe default profile: Auto-run OFF, Require code block ON, Auto-stop nonsense ON, Run Mode Temp Sandbox.\n"
             "- Fast iteration profile: Auto-run ON, Insert Mode Replace, Run timeout 60, Coding max tokens 700-1000.\n"
             "- Shinzen profile (balanced): cooldown 20, refresh 30, idle ideas ON, idle interval 60.\n\n"
-            "Model Recommendations\n"
-            "- Best coding quality (current list): mlx-community/Qwen2.5-Coder-7B-Instruct-4bit.\n"
-            "- Good fallback: mlx-community/DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx.\n"
-            "- Lightweight fallback: mlx-community/starcoder2-7b-4bit.\n"
-            "- Best Shinzen/comment quality: mlx-community/Phi-3.5-mini-instruct-4bit.\n"
-            "- Alternative Shinzen fast model: mlx-community/Qwen2.5-1.5B-Instruct-4bit.\n\n"
             "Coding Card Controls\n"
             "- Auto Run: run generated coding output immediately after injection.\n"
-            "- Insert mode: replace editor content or append generated code.\n"
+            "- Insert mode: replace, append, or preview-only (no injection).\n"
             "- Stop: cancels an in-progress assistant response.\n"
             "- /Runtime /Engine /Errors /Shinzen: attach context shortcuts for coding prompts.\n\n"
             "Shinzen Mascot\n"
@@ -1301,6 +1304,12 @@ class Code9(ctk.CTk):
             self._set_chat_welcome(widget, kind=kind)
         except Exception:
             pass
+    
+    def request_shinzen_ideas(self):
+        # We explicitly set the text and pass the intent="idea" flag
+        idea_prompt = "Give me some high-level architectural ideas or project upgrades."
+        self.coding_card["var"].set(idea_prompt)
+        self.ask_coding_ai(intent="idea")
 
     def _copy_from_widget(self, widget):
         """Copy selection if present, else copy the entire widget content to clipboard."""
@@ -1646,50 +1655,52 @@ class Code9(ctk.CTk):
     def _on_coding_ask_clicked(self):
         self.ask_coding_ai()
 
-    def ask_coding_ai(self, event=None):
-        # Read the entry but strip the visual prefix (if present) so attachments remain visible in the entry
+    def ask_coding_ai(self, event=None, intent=None):
         var = self.coding_card["var"]
         val = var.get()
         prefix = getattr(self, "_coding_attach_prefix", "")
 
-        # If user typed attachment tags like /Errors or /Engine at start, process them into attachments
+        # 1. Strip the visual attachment prefix if present
+        if prefix and val.startswith(prefix):
+            raw_query = val[len(prefix):].strip()
+        else:
+            raw_query = val.strip()
+
+        # 2. Check for Intent commands (so the AI knows if it's a question or code)
+        if not intent:
+            intent = "code" # Default to writing code
+            lower_q = raw_query.lower()
+            if lower_q.startswith("/ask ") or lower_q.startswith("/chat ") or lower_q in ("/ask", "/chat"):
+                intent = "chat"
+                raw_query = re.sub(r"^/(ask|chat)\s*", "", raw_query, flags=re.IGNORECASE)
+            elif lower_q.startswith("/idea"):
+                intent = "idea"
+                raw_query = re.sub(r"^/idea\s*", "", raw_query, flags=re.IGNORECASE)
+                if not raw_query:
+                    raw_query = "Give me some high-level architectural ideas or project upgrades."
+
+        if not raw_query and intent != "idea":
+            return
+
+        # 3. Process Context Attachments
         try:
-            leading = val
-            if prefix and val.startswith(prefix):
-                leading = val[len(prefix):].lstrip()
-            # find tags like /Errors, /Runtime, /Engine, /General (case-insensitive) anywhere in leading text
-            tags = [t.strip('/') for t in re.findall(r"/(\w+)", leading)]
+            tags = [t.strip('/') for t in re.findall(r"/(\w+)", raw_query)]
             if tags:
-                # map tag to attach call
                 for t in tags:
                     tl = t.lower()
-                    if tl.startswith("err"):
-                        self._attach_errors_to_coding()
-                    elif tl.startswith("run") or tl == "runtime":
-                        self._attach_runtime_output_to_coding()
-                    elif tl.startswith("eng"):
-                        self._attach_editor_to_coding()
-                    elif tl.startswith("gen"):
-                        self._attach_general_chat_to_coding()
-                    elif tl.startswith("shin"):
-                        self._attach_shinzen_to_coding()
-                # remove tags from value
-                # strip all /word tokens
-                leading = re.sub(r"/\w+", "", leading).strip()
-            # final query text is remaining leading + rest after prefix removed
-            if prefix and val.startswith(prefix):
-                remaining = leading
-            else:
-                remaining = leading
-            query = remaining.strip()
+                    if tl.startswith("err"): self._attach_errors_to_coding()
+                    elif tl.startswith("run") or tl == "runtime": self._attach_runtime_output_to_coding()
+                    elif tl.startswith("eng"): self._attach_editor_to_coding()
+                    elif tl.startswith("gen"): self._attach_general_chat_to_coding()
+                    elif tl.startswith("shin"): self._attach_shinzen_to_coding()
+                # Remove attachment tags, but KEEP regular text
+                raw_query = re.sub(r"/(err|run|runtime|eng|gen|shin)\w*", "", raw_query, flags=re.IGNORECASE).strip()
+            
+            query = raw_query.strip()
         except Exception:
-            # fallback parsing
-            if prefix and val.startswith(prefix):
-                query = val[len(prefix):].strip()
-            else:
-                query = val.strip()
+            query = raw_query.strip()
 
-        if not query:
+        if not query and intent != "idea":
             return
 
         try:
@@ -1699,32 +1710,33 @@ class Code9(ctk.CTk):
             req_id = None
 
         self._append_user(self.coding_card["text"], query)
-        # keep the prefix in the entry after sending
+        
         if prefix:
             var.set(prefix)
         else:
             var.set("")
+            
         if self.model_ready:
             self.start_loader()
-        self._set_presence_message("Coding AI is crafting code...", mood="thinking")
+            
+        self._set_presence_message("Thinking..." if intent in ["chat", "idea"] else "Coding AI is crafting code...", mood="thinking")
 
-        # Pause Shinzen suggestions while user is explicitly asking so it doesn't interrupt.
         try:
             self._pause_shinzen()
         except Exception:
             pass
 
-        threading.Thread(target=self._coding_worker, args=(query, req_id), daemon=True).start()
+        threading.Thread(target=self._coding_worker, args=(query, req_id, intent), daemon=True).start()
 
-    def _coding_worker(self, query, req_id=None):
+    def _coding_worker(self, query, req_id=None, intent="code"):
         self.after(0, self._lock_ui)
         editor_snapshot = self.editor.get("1.0", "end-1c")
-        # Include any attached resources into the prompt so the model can use them.
+        
+        # Include any attached resources
         attachments_text = ""
         try:
             if self.coding_attachments:
                 attachments_text = "Attached resources:\n\n" + "\n\n".join(self.coding_attachments.values()) + "\n\n"
-            # Optionally include Shinzen suggestions automatically into the prompt
             if getattr(self, 'include_shinzen_in_coding', True):
                 try:
                     shin_txt = (getattr(self, "_last_shinzen_comment", "") or "").strip()
@@ -1740,79 +1752,16 @@ class Code9(ctk.CTk):
         except Exception:
             attachments_text = ""
 
-        prompt = (
-            "You are a Python coding assistant. Be concise and direct.\n"
-            "Rules:\n"
-            "- Return exactly one runnable Python fenced ```python block.\n"
-            "- One brief sentence of explanation max — no preamble, no filler.\n"
-            "- Do not repeat the user's question or describe what you're about to do.\n"
-            "- Only include code that is actually used.\n\n"
-            f"{attachments_text}"
-            "Current engine code:\n"
-            f"```python\n{editor_snapshot[:4200]}\n```\n\n"
-            f"Request: {query}\n\n"
-            "Response:"
-        )
-
-        try:
-            resp = self._generate_text(prompt=prompt, max_tokens=self.coding_max_tokens, mode="coding")
-            # If request cancelled while generating, do not append or inject
-            if req_id is not None and req_id != self.abort_tokens.get('coding'):
-                self.after(0, lambda: self._set_status_temporary("Coding AI response cancelled", duration=1200))
-                return
-
-            normalized = self._normalize_coding_response(resp)
-            if normalized.get("needs_retry"):
-                try:
-                    repair_prompt = self._build_coding_repair_prompt(query, resp, normalized.get("issue"))
-                    repaired = self._generate_text(
-                        prompt=repair_prompt,
-                        max_tokens=min(self.coding_max_tokens, 900),
-                        mode="coding",
-                    )
-                    repaired_norm = self._normalize_coding_response(repaired)
-                    should_use_repair = (
-                        repaired_norm.get("syntax_ok")
-                        and (
-                            (not normalized.get("syntax_ok"))
-                            or int(repaired_norm.get("quality_score", 0)) >= int(normalized.get("quality_score", 0))
-                        )
-                    )
-                    if should_use_repair:
-                        resp = repaired
-                        normalized = repaired_norm
-                except Exception:
-                    pass
-
-            display_text = normalized.get("response_text") or self._sanitize_response(resp, mode="coding")
-
-            if self.stop_on_bad_response and self._is_nonsense_response(display_text, mode="coding"):
-                self.after(0, lambda: self._append_assistant(self.coding_card["text"], "Stopped: coding output looked repetitive or invalid. Try a shorter, more specific prompt.", label="Coding AI"))
-                self.after(0, lambda: self._set_status_temporary("Stopped low-quality coding reply", duration=1800))
-                return
-
-            self.after(
-                0,
-                lambda r=display_text, rid=req_id: self._append_assistant(
-                    self.coding_card["text"], r, label="Coding AI", kind="coding", request_id=rid
-                ),
+        # ROUTE INTENT TO DIFFERENT SYSTEM PROMPTS
+        if intent == "idea":
+            prompt = (
+                "You are a technical architect. Review the engine code and provide 3-4 high-level project upgrade ideas or architectural suggestions.\n"
+                "Rules:\n"
+                "- Do NOT write any Python code blocks. Do not use ```python.\n"
+                "- Use clear, concise bullet points.\n\n"
+                f"{attachments_text}"
+                f"Current engine code:\n
             )
-
-            injectable_code = normalized.get("code") or ""
-            if injectable_code:
-                self.after(0, lambda c=injectable_code: self._inject_code_into_engine(c))
-            else:
-                issue = normalized.get("issue") or "No valid Python output found."
-                self.after(0, lambda msg=issue: self._set_status_temporary(f"Injection skipped: {msg}", duration=2400))
-                self.after(0, lambda: self._set_presence_message("I kept your engine safe from malformed code.", mood="concern", duration=2300))
-        finally:
-            # Resume Shinzen suggestions after coding response handling completes
-            try:
-                self.after(0, self._resume_shinzen)
-            except Exception:
-                pass
-            self.after(0, self.stop_loader)
-            self.after(0, self._refresh_status)
 
     def _extract_code_blocks(self, text):
         try:
@@ -1834,6 +1783,11 @@ class Code9(ctk.CTk):
         except Exception as e:
             self._set_status_temporary(f"Injection skipped: invalid Python ({e})", duration=2600)
             self._set_presence_message("I blocked malformed code before it reached Engine.", mood="alert", duration=2500)
+            return False
+
+        if self.insert_mode == "noop":
+            self._set_status_temporary("Preview only mode: AI code was not injected", duration=2200)
+            self._set_presence_message("Preview mode is on. Your engine code is unchanged.", mood="listening", duration=2200)
             return False
 
         before = self.editor.get("1.0", "end-1c")
@@ -1862,6 +1816,187 @@ class Code9(ctk.CTk):
         return True
 
     # -------------------- RUN / ENGINE --------------------
+    def _resolve_python_exec(self):
+        candidate = (self.python_exec_path or "").strip()
+        if candidate:
+            if os.path.isabs(candidate) and os.path.exists(candidate):
+                return candidate
+            found = shutil.which(candidate)
+            if found:
+                return found
+        return sys.executable
+
+    def _resolve_project_root(self):
+        if self.project_root and os.path.isdir(self.project_root):
+            return os.path.abspath(self.project_root)
+        if self.current_file_path:
+            return os.path.abspath(os.path.dirname(self.current_file_path) or os.getcwd())
+        if self.last_opened_file and os.path.exists(self.last_opened_file):
+            return os.path.abspath(os.path.dirname(self.last_opened_file) or os.getcwd())
+        return os.getcwd()
+
+    def _workspace_copy_ignore(self, _src, names):
+        ignored = {
+            ".git",
+            ".hg",
+            ".svn",
+            "__pycache__",
+            ".mypy_cache",
+            ".pytest_cache",
+            ".ruff_cache",
+            ".venv",
+            "venv",
+            "node_modules",
+        }
+        out = []
+        for name in names:
+            if name in ignored:
+                out.append(name)
+            elif name.endswith(".pyc") or name.endswith(".pyo"):
+                out.append(name)
+        return out
+
+    def _build_workspace_sandbox(self, code_to_write):
+        temp_ctx = tempfile.TemporaryDirectory()
+        sandbox_root = temp_ctx.name
+        src_root = self._resolve_project_root()
+        copied_root = os.path.join(sandbox_root, "workspace")
+
+        if os.path.isdir(src_root):
+            try:
+                shutil.copytree(
+                    src_root,
+                    copied_root,
+                    dirs_exist_ok=True,
+                    ignore=self._workspace_copy_ignore,
+                )
+            except Exception:
+                copied_root = sandbox_root
+        else:
+            copied_root = sandbox_root
+
+        run_name = "snippet.py"
+        if self.current_file_path:
+            run_name = os.path.basename(self.current_file_path) or run_name
+
+        run_path = os.path.join(copied_root, run_name)
+        if self.current_file_path and os.path.isdir(src_root):
+            try:
+                rel = os.path.relpath(self.current_file_path, src_root)
+                if rel and not rel.startswith(".."):
+                    run_path = os.path.join(copied_root, rel)
+            except Exception:
+                pass
+
+        os.makedirs(os.path.dirname(run_path), exist_ok=True)
+        with open(run_path, "w", encoding="utf-8") as f:
+            f.write(code_to_write)
+
+        run_cwd = os.path.dirname(run_path) or copied_root
+        return temp_ctx, run_path, run_cwd, copied_root
+
+    def _collect_top_level_imports(self, code):
+        names = set()
+        try:
+            tree = ast.parse(code or "")
+        except Exception:
+            return []
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    root = (alias.name or "").split(".")[0].strip()
+                    if root:
+                        names.add(root)
+            elif isinstance(node, ast.ImportFrom):
+                if getattr(node, "level", 0):
+                    continue
+                module = (node.module or "").split(".")[0].strip()
+                if module:
+                    names.add(module)
+        return sorted(names)
+
+    def _is_local_module(self, module_name, project_root):
+        if not module_name or not project_root:
+            return False
+        try:
+            candidate_file = os.path.join(project_root, f"{module_name}.py")
+            candidate_dir = os.path.join(project_root, module_name)
+            candidate_pkg = os.path.join(project_root, module_name, "__init__.py")
+            return os.path.exists(candidate_file) or os.path.exists(candidate_pkg) or os.path.isdir(candidate_dir)
+        except Exception:
+            return False
+
+    def _find_missing_modules(self, imports, project_root, python_exec=None):
+        stdlib = getattr(sys, "stdlib_module_names", set())
+        candidates = []
+        for name in imports:
+            if not name:
+                continue
+            if name in stdlib or name in sys.builtin_module_names:
+                continue
+            if self._is_local_module(name, project_root):
+                continue
+            candidates.append(name)
+
+        if not candidates:
+            return []
+
+        if python_exec and os.path.abspath(python_exec) != os.path.abspath(sys.executable):
+            try:
+                probe_cmd = [
+                    python_exec,
+                    "-c",
+                    "import importlib.util,sys;mods=sys.argv[1:];missing=[m for m in mods if importlib.util.find_spec(m) is None];print('\\n'.join(missing))",
+                    *candidates,
+                ]
+                res = subprocess.run(
+                    probe_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=15,
+                )
+                if res.returncode == 0:
+                    return sorted({ln.strip() for ln in (res.stdout or "").splitlines() if ln.strip()})
+            except Exception:
+                pass
+
+        missing = []
+        for name in candidates:
+            try:
+                spec = importlib.util.find_spec(name)
+            except Exception:
+                spec = None
+            if spec is None:
+                missing.append(name)
+        return sorted(set(missing))
+
+    def _install_missing_modules(self, python_exec, modules):
+        if not modules:
+            return True
+        cmd = [python_exec, "-m", "pip", "install", *modules]
+        self.after(0, lambda: self._append_output(f"[Dependency install]\n$ {' '.join(cmd)}\n"))
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            for line in iter(proc.stdout.readline, ""):
+                if not line:
+                    break
+                safe_line = self._sanitize_text(line)
+                self.after(0, lambda ln=safe_line: self._append_output("[pip] " + ln))
+            rc = proc.wait()
+            self.after(0, lambda: self._append_output(f"[Dependency install exited with code {rc}]\n\n"))
+            return rc == 0
+        except Exception as e:
+            self.after(0, lambda err=str(e): self._append_output(f"[Dependency install failed] {err}\n\n"))
+            return False
+
     def _run_code(self, code, manage_loader=False):
         code_to_write = code if code.endswith("\n") else code + "\n"
 
@@ -1879,6 +2014,7 @@ class Code9(ctk.CTk):
         temp_ctx = None
         run_path = None
         run_cwd = None
+        project_context_root = None
 
         if self.run_mode == "active_file" and self.current_file_path:
             try:
@@ -1886,10 +2022,26 @@ class Code9(ctk.CTk):
                 run_cwd = os.path.dirname(run_path) or os.getcwd()
                 with open(run_path, "w", encoding="utf-8") as f:
                     f.write(code_to_write)
+                project_context_root = run_cwd
                 self.after(0, self._mark_editor_saved)
             except Exception as e:
                 self.after(0, lambda err=str(e): self._append_output(f"Could not save active file, falling back to temp run: {err}\n"))
                 run_path = None
+                run_cwd = None
+
+        if run_path is None and self.run_mode == "workspace":
+            try:
+                temp_ctx, run_path, run_cwd, project_context_root = self._build_workspace_sandbox(code_to_write)
+            except Exception as e:
+                self.after(0, lambda err=str(e): self._append_output(f"Workspace sandbox setup failed, falling back to temp run: {err}\n"))
+                run_path = None
+                run_cwd = None
+                if temp_ctx is not None:
+                    try:
+                        temp_ctx.cleanup()
+                    except Exception:
+                        pass
+                temp_ctx = None
 
         if run_path is None:
             temp_ctx = tempfile.TemporaryDirectory()
@@ -1897,13 +2049,39 @@ class Code9(ctk.CTk):
             run_path = os.path.join(temp_ctx.name, "snippet.py")
             with open(run_path, "w", encoding="utf-8") as f:
                 f.write(code_to_write)
+            project_context_root = run_cwd
 
-        cmd = [sys.executable, "-u", run_path]
-        env = os.environ.copy()
-        env["PYTHONUNBUFFERED"] = "1"
+        python_exec = self._resolve_python_exec()
+        imports = self._collect_top_level_imports(code_to_write)
+        missing = self._find_missing_modules(imports, project_context_root or run_cwd, python_exec=python_exec)
 
         self.after(0, self._open_runtime_terminal)
         self.after(0, self._clear_output_panel)
+
+        if missing:
+            if self.auto_install_missing_imports:
+                ok = self._install_missing_modules(python_exec, missing)
+                if not ok:
+                    self.after(0, lambda mods=", ".join(missing): self._append_output(f"Warning: some imports may still be missing: {mods}\n"))
+            else:
+                pretty = ", ".join(missing)
+                pip_cmd = f"{python_exec} -m pip install {pretty}"
+                self.after(0, lambda p=pretty, pcmd=pip_cmd: self._append_output(
+                    f"Missing imports detected: {p}\nAuto-install is disabled. Install with:\n$ {pcmd}\n\n"
+                ))
+
+        cmd = [python_exec, "-u", run_path]
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        env.setdefault("PYTHONUTF8", "1")
+        env.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+
+        python_paths = [run_cwd, project_context_root]
+        existing_py_path = env.get("PYTHONPATH", "")
+        if existing_py_path:
+            python_paths.append(existing_py_path)
+        env["PYTHONPATH"] = os.pathsep.join([p for p in python_paths if p])
+
         self.after(0, lambda: self._append_output(f"[Run started {time.strftime('%H:%M:%S')}]\n$ {' '.join(cmd)}\n\n"))
         self.after(0, lambda: self._set_presence_message("Running engine code...", mood="running"))
 
@@ -2518,6 +2696,33 @@ class Code9(ctk.CTk):
             pass
 
     # -------------------- FILE OPS --------------------
+    def _set_project_root(self, path):
+        try:
+            if not path:
+                return False
+            abs_path = os.path.abspath(path)
+            if not os.path.isdir(abs_path):
+                return False
+            self.project_root = abs_path
+            self._save_preferences()
+            return True
+        except Exception:
+            return False
+
+    def _open_project(self):
+        try:
+            path = filedialog.askdirectory(title="Open project folder")
+            if not path:
+                return False
+            if self._set_project_root(path):
+                self._set_status_temporary(f"Project root set: {os.path.basename(path)}", duration=2200)
+                return True
+            self._set_status_temporary("Could not set project root", duration=2000)
+            return False
+        except Exception as e:
+            self._set_status_temporary(f"Open project failed: {e}", duration=2200)
+            return False
+
     def _open_snippet(self, path=None, from_restore=False):
         fn = path
         if not fn:
@@ -2535,6 +2740,7 @@ class Code9(ctk.CTk):
             self.editor.insert("1.0", data)
             self.current_file_path = fn
             self.last_opened_file = fn
+            self.project_root = os.path.dirname(fn) or self.project_root
             self.editor_dirty = False
             self.editor.edit_modified(False)
             self._highlight_syntax()
@@ -2565,6 +2771,7 @@ class Code9(ctk.CTk):
                 f.write(content)
             self.current_file_path = fn
             self.last_opened_file = fn
+            self.project_root = os.path.dirname(fn) or self.project_root
             self.editor_dirty = False
             self.editor.edit_modified(False)
             self._update_file_label()
@@ -2595,7 +2802,12 @@ class Code9(ctk.CTk):
         self._update_file_label()
 
     def _update_run_mode_badge(self):
-        txt = "Run: Active File" if self.run_mode == "active_file" else "Run: Temp Sandbox"
+        if self.run_mode == "active_file":
+            txt = "Run: Active File"
+        elif self.run_mode == "workspace":
+            txt = "Run: Workspace Sandbox"
+        else:
+            txt = "Run: Temp Sandbox"
         self.run_mode_badge.configure(text=txt)
 
     # -------------------- SYNTAX + SANITIZE --------------------
@@ -3288,6 +3500,9 @@ class Code9(ctk.CTk):
     def _on_open_clicked(self):
         self._open_snippet()
 
+    def _on_open_project_clicked(self):
+        self._open_project()
+
     def _on_save_clicked(self):
         self._save_snippet(force_dialog=False)
 
@@ -3327,19 +3542,38 @@ class Code9(ctk.CTk):
             duration=1800,
         )
 
+    def _insert_mode_button_text(self):
+        if self.insert_mode == "append":
+            return "Insert: Append"
+        if self.insert_mode == "noop":
+            return "Insert: Off"
+        return "Insert: Replace"
+
+    def _insert_mode_status_text(self):
+        if self.insert_mode == "append":
+            return "Insert mode: Append"
+        if self.insert_mode == "noop":
+            return "Insert mode: Preview only"
+        return "Insert mode: Replace"
+
     def _toggle_insert_mode(self):
-        self.insert_mode = "append" if self.insert_mode == "replace" else "replace"
+        cycle = ["replace", "append", "noop"]
+        try:
+            idx = cycle.index(self.insert_mode)
+        except ValueError:
+            idx = 0
+        self.insert_mode = cycle[(idx + 1) % len(cycle)]
         self._refresh_coding_controls()
         self._save_preferences()
         self._set_status_temporary(
-            "Insert mode: Append" if self.insert_mode == "append" else "Insert mode: Replace",
+            self._insert_mode_status_text(),
             duration=1800,
         )
 
     def _refresh_coding_controls(self):
         try:
             self.auto_run_btn.configure(text="Auto Run: On" if self.auto_run_coding else "Auto Run: Off")
-            self.insert_mode_btn.configure(text="Insert: Replace" if self.insert_mode == "replace" else "Insert: Append")
+            self.insert_mode_btn.configure(text=self._insert_mode_button_text())
         except Exception:
             pass
 
@@ -3368,6 +3602,8 @@ class Code9(ctk.CTk):
         self.bind_all("<Command-s>", self._shortcut_save)
         self.bind_all("<Control-o>", self._shortcut_open)
         self.bind_all("<Command-o>", self._shortcut_open)
+        self.bind_all("<Control-Shift-O>", self._shortcut_open_project)
+        self.bind_all("<Command-Shift-O>", self._shortcut_open_project)
         self.bind_all("<F1>", lambda _e: self._open_help())
 
     # -------------------- Layout helpers --------------------
@@ -3407,6 +3643,10 @@ class Code9(ctk.CTk):
 
     def _shortcut_open(self, event=None):
         self._on_open_clicked()
+        return "break"
+
+    def _shortcut_open_project(self, event=None):
+        self._on_open_project_clicked()
         return "break"
 
 
