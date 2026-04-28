@@ -1728,40 +1728,54 @@ class Code9(ctk.CTk):
 
         threading.Thread(target=self._coding_worker, args=(query, req_id, intent), daemon=True).start()
 
-    def _coding_worker(self, query, req_id=None, intent="code"):
-        self.after(0, self._lock_ui)
-        editor_snapshot = self.editor.get("1.0", "end-1c")
-        
-        # Include any attached resources
-        attachments_text = ""
-        try:
-            if self.coding_attachments:
-                attachments_text = "Attached resources:\n\n" + "\n\n".join(self.coding_attachments.values()) + "\n\n"
-            if getattr(self, 'include_shinzen_in_coding', True):
-                try:
-                    shin_txt = (getattr(self, "_last_shinzen_comment", "") or "").strip()
-                    if not shin_txt:
-                        shin_txt_widget = getattr(self, 'shinzen_bubble_text', None) or getattr(self, 'shinzen_suggestions', None)
-                        if shin_txt_widget is not None:
-                            shin_txt = shin_txt_widget.get('1.0', 'end-1c').strip()
-                    shin_payload = AttachmentManager.prepare_shinzen_snippet(shin_txt, max_chars=320)
-                    if shin_payload:
-                        attachments_text = (shin_payload + "\n\n") + attachments_text
-                except Exception:
-                    pass
-        except Exception:
-            attachments_text = ""
+    def _coding_worker(self, query, reqid=None, intent="code"):
+    try:
+        self.after0(self.lockui)
+        editor = getattr(self, "editor", None)
+        if editor is None:
+            return
 
-        # ROUTE INTENT TO DIFFERENT SYSTEM PROMPTS
-        if intent == "idea":
-            prompt = (
-                "You are a technical architect. Review the engine code and provide 3-4 high-level project upgrade ideas or architectural suggestions.\n"
-                "Rules:\n"
-                "- Do NOT write any Python code blocks. Do not use ```python.\n"
-                "- Use clear, concise bullet points.\n\n"
-                f"{attachments_text}"
-                f"Current engine code:\n
-            )
+        try:
+            editorsnapshot = editor.get("1.0", "end-1c")
+        except Exception:
+            editorsnapshot = ""
+
+        attachmentstext = ""
+        try:
+            attachments = getattr(self, "codingattachments", {}) or {}
+            if attachments:
+                attachmentstext = "Attached resources:\n" + "\n\n".join(
+                    str(v) for v in attachments.values() if v
+                )
+        except Exception:
+            attachmentstext = ""
+
+        prompt = self.buildcodingprompt(query, editorsnapshot, attachmentstext, intent)
+        response = self.generatetext(prompt, self.codingmaxtokens, mode=intent)
+
+        if reqid is not None and reqid != getattr(self, "aborttokens", {}).get("coding", reqid):
+            return
+
+        if not response:
+            return
+
+        normalized = self.normalizecodingresponses(response)
+        if normalized.get("needsretry"):
+            repair_prompt = self.buildcodingrepairprompt(query, response, normalized.get("issue"))
+            repaired = self.generatetext(repair_prompt, self.codingmaxtokens, mode="coding")
+            normalized = self.normalizecodingresponses(repaired)
+
+        if normalized.get("code"):
+            self.after0(self.injectcodeintoengine, normalized["code"])
+        else:
+            self.after0(self.appendassistant, self.codingcardtext, response, label="Code AI")
+    except Exception:
+        self.after0(self.appendoutput, traceback.format_exc())
+    finally:
+        try:
+            self.after0(self.refreshstatus)
+        except Exception:
+            pass
 
     def _extract_code_blocks(self, text):
         try:
