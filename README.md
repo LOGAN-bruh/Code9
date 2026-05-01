@@ -34,10 +34,9 @@ WARNING⚠️: Application only will run on Mac.
 2. Drag the `Code9.app` into your Mac's `Applications` folder.
 3. Double-click to run! (Note: If your Mac blocks it as an unidentified developer, Right-Click the app and select "Open").
 
-#### .app download for Code9
 [⬇️ Download Code9 for macOS](https://drive.google.com/file/d/1BKeH_li0E6XUs2aWtM5cJ0Xl5Z2gMXTk/view?usp=sharing)
 
-## Dificulties 😭
+## Dificulties
 
 The most significant technical hurdle will be Contextual Accuracy & Safety. 
 1.  Logic Mapping: It is difficult to ensure the AI creates a shell that actually fits the user’s intent. For example, if a user writes print(data.mean()), the AI must correctly guess if data should be a NumPy array, a Pandas DataFrame, or a simple list. If it guesses wrong, the code will crash despite having a "shell."
