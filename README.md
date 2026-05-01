@@ -26,56 +26,9 @@ The primary goal of Code9 is to eliminate "environment friction." Developers oft
  - File writing/rewriting
 
 ## How to Run
-WARNING⚠️: Application Optimised for Mac or Windows Systems with CUDA support.
+WARNING⚠️: Application only will run on Mac.
 
 ### Running on Mac :
-#### Navigate to Mac Terminal. Install dependencies with these (Please install them one at a time or skip if already downloaded) -  
-
- ```sh
- /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
- ```
-
- ```sh
- brew install python python-tk
- ```
-
- ```sh
- pip3 install customtkinter mlx mlx-lm
- ```
-
- ```sh
- pip3 install torch
- ```
-
-Navigate to the folder where your files are located and run - 
-
-  ```sh
-  python3 Code9.py
-  ```
-
-The first time you run a query, the application will automatically download the necessary models from Hugging Face. Subsequent runs will be much faster.
-
-### Running on Windows System with CUDA support🥶:
-Navigate to and open Command Prompt or PowerShell. Install dependencies with this -
-
-```sh
-pip install torch --index-url https://download.pytorch.org/whl/cu121
-```
-
-Install the UI dependencies with this - 
-
-```sh
-pip install customtkinter Pillow
-```
-
-Navigate to the folder containing your script and run -
-
-```sh
-python Code9.py
-```
-    
-The app will detect CUDA and automatically route the AI model operations through your NVIDIA GPU 👍
-
 
 ## Dificulties 😭
 
