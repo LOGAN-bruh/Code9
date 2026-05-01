@@ -44,8 +44,12 @@ The most significant technical hurdle will be Contextual Accuracy & Safety.
 3.  Model Latency: Balancing the size of the MLX model (e.g., 3B vs 7B parameters) so that the "shell" is generated fast enough to feel like a real-time IDE, rather than a slow chat-bot.
 
 ## Code9 UML Mockup
-![Code9 UML](https://github.com/LOGAN-bruh/Code9/blob/main/images/Code9UML.drawio.png)
+![Code9 UML](https://github.com/LOGAN-bruh/Code9/blob/main/images/UMLforCode9.png)
 
 ## Code9 UI Mockup
 
-![Code9 UI](https://github.com/LOGAN-bruh/Code9/blob/main/images/Untitled%20drawing.png)
+![Code9 UI Mockup](https://github.com/LOGAN-bruh/Code9/blob/main/images/Untitled%20drawing.png)
+
+## Code9 Running UI
+
+![Code9 UI](https://github.com/LOGAN-bruh/Code9/blob/main/images/Code9RunningUI.png)
