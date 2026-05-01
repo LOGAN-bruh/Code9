@@ -31,8 +31,11 @@ WARNING⚠️: Application only will run on Mac.
 ### Running on Mac :
 
 1. Download and extract the `Code9.zip` file.
-2. Drag the `Code9.app` into your Mac's `Applications` folder.
-3. Double-click to run! (Note: If your Mac blocks it as an unidentified developer, Right-Click the app and select "Open").
+2. Note: If your Mac blocks it as an unidentified developer, navigate to terminal and run 
+```sh
+sudo xattr -rd com.apple.quarantine ~/Downloads/Code9.app
+```
+3. Double-click the application in your Downloads to run!
 
 [⬇️ Download Code9 for macOS](https://drive.google.com/file/d/1BKeH_li0E6XUs2aWtM5cJ0Xl5Z2gMXTk/view?usp=sharing)
 
