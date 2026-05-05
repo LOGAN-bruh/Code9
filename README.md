@@ -25,11 +25,12 @@ The primary goal of Code9 is to eliminate "environment friction." Developers oft
  - Friendly UI with easy to use systems
  - File writing/rewriting
 
-## How to Run
-WARNING⚠️: Application only will run on Mac.
+## Warnings
+ - The .app for Code9 is 6GB of storage. Please allocate at least 7GB of storage for the app.
+ - Recomended Machine: >= Apple m5, >= 16GB of Ram
+ - Source code will only run with downloaded dependencies requested by terminal
 
-### Running on Mac :
-
+## Running on Mac :
 1. Download and extract the `Code9.zip` file.
    
    [⬇️ Download Code9 for macOS](https://drive.google.com/file/d/1BKeH_li0E6XUs2aWtM5cJ0Xl5Z2gMXTk/view?usp=sharing)
