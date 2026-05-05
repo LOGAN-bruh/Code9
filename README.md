@@ -27,7 +27,7 @@ The primary goal of Code9 is to eliminate "environment friction." Developers oft
 
 ## Warnings
  - The .app for Code9 is 6GB of storage. Please allocate at least 7GB of storage for the app.
- - Recomended Machine: >= Apple m5, >= 16GB of Ram
+ - Recomended Machine: >= Apple M5 Chip, >= 16GB of Ram
  - Source code will only run with downloaded dependencies requested by terminal
 
 ## Running on Mac :
