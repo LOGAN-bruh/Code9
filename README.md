@@ -26,7 +26,7 @@ The primary goal of Code9 is to eliminate "environment friction." Developers oft
  - File writing/rewriting
 
 ## Warnings
- - The .app for Code9 is 6GB of storage. Please allocate at least 7GB of storage for the app.
+ - Because AI models are included in the app, the app for Code9 is 6GB of storage. Please allocate at least 7GB of storage for the app.
  - Recomended Machine: >= Apple M5 Chip, >= 16GB of Ram
  - Source code will only run with downloaded dependencies requested by terminal
 
