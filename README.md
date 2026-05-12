@@ -37,7 +37,7 @@ The primary goal of Code9 is to eliminate "environment friction." Developers oft
    
 3. Google will try to warn you not to download, press Download Anyways. Note: If your Mac blocks it as an unidentified developer, navigate to terminal, run the following command, and enter your password.
    ```sh
-   sudo xattr -rd com.apple.quarantine ~/Downloads/Code9.app
+   xattr -rd com.apple.quarantine ~/Downloads/Code9.app
    ```
 3. Double-click the application in your Downloads to run!
 
